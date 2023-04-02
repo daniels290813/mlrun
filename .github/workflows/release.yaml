@@ -167,9 +167,9 @@ jobs:
       - name: Create tutorials tar
         run: |
           tar -cvf mlrun-tutorials.tar docs/tutorial
-      - uses: ncipollo/release-action@v1
+      - name: Add tutorials tar to release
+        uses: ncipollo/release-action@v1
         with:
           tag: v${{ github.event.inputs.version }}
-#           token: ${{ secrets.RELEASE_GITHUB_ACCESS_TOKEN }}
-          allowUpdates: true
+          token: ${{ secrets.RELEASE_GITHUB_ACCESS_TOKEN }}
           artifacts: mlrun-tutorials.tar
