@@ -163,6 +163,7 @@ jobs:
     name: Bundle tutorials
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v3
       - name: Create tutorials tar
         run: |
           tar -cvf mlrun-tutorials.tar docs/tutorial
