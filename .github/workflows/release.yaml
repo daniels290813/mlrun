@@ -158,13 +158,17 @@ jobs:
           prerelease: ${{ github.event.inputs.pre_release }}
           body: ${{ steps.resolve-release-notes.outputs.body }}
           
-      - name: create tar for tutorial dir
-        run: cd docs ;  tar -cvf tutorial.tar tutorial
+  update-tutorials:
+    name: Update tutorials release
+    runs-on: ubuntu-latest
+    steps:
+    - name: create tar for tutorial dir
+      run: cd docs ;  tar -cvf tutorial.tar tutorial
 
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: docs/tutorial.tar
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: docs/tutorial.tar
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
