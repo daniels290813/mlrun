@@ -98,69 +98,68 @@ jobs:
 #         env:
 #           INPUT_VERSION: ${{ github.event.inputs.version }}
 
-  create-releases:
-    name: Create release & tag v${{ github.event.inputs.version }}
-    runs-on: ubuntu-latest
-    if: github.event.inputs.skip_create_tag_release != 'true'
-    steps:
-      - uses: ncipollo/release-action@v1
-        with:
-          tag: v${{ github.event.inputs.version }}
-          commit: ${{ github.ref_name }}
-          token: ${{ secrets.RELEASE_GITHUB_ACCESS_TOKEN }}
-          prerelease: ${{ github.event.inputs.pre_release }}
-      - uses: ncipollo/release-action@v1
-        with:
-          repo: ui
-          tag: v${{ github.event.inputs.version }}
-          commit: ${{ github.ref_name }}
-          token: ${{ secrets.RELEASE_GITHUB_ACCESS_TOKEN }}
-          # experienced 500 errors when trying to create release notes for ui repo with `prerelease flag`
-          # prerelease: ${{ github.event.inputs.pre_release }}
+#   create-releases:
+#     name: Create release & tag v${{ github.event.inputs.version }}
+#     runs-on: ubuntu-latest
+#     if: github.event.inputs.skip_create_tag_release != 'true'
+#     steps:
+#       - uses: ncipollo/release-action@v1
+#         with:
+#           tag: v${{ github.event.inputs.version }}
+#           commit: ${{ github.ref_name }}
+#           token: ${{ secrets.RELEASE_GITHUB_ACCESS_TOKEN }}
+#           prerelease: ${{ github.event.inputs.pre_release }}
+#       - uses: ncipollo/release-action@v1
+#         with:
+#           repo: ui
+#           tag: v${{ github.event.inputs.version }}
+#           commit: ${{ github.ref_name }}
+#           token: ${{ secrets.RELEASE_GITHUB_ACCESS_TOKEN }}
+#           # experienced 500 errors when trying to create release notes for ui repo with `prerelease flag`
+#           # prerelease: ${{ github.event.inputs.pre_release }}
 
-  update-release-notes:
-    name: Update release notes
-    runs-on: ubuntu-latest
-    if: github.event.inputs.generate_release_notes == 'true'
-    needs: create-releases
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v4
-        with:
-          python-version: 3.9
-          cache: pip
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r automation/requirements.txt -r dev-requirements.txt && pip install -e .
-      - name: Generate release notes
-        id: release-notes
-        run: |
-          make release-notes MLRUN_OLD_VERSION="v$INPUT_PREVIOUS_VERSION" MLRUN_VERSION="v$INPUT_VERSION" MLRUN_RELEASE_BRANCH=${{ github.ref_name }} MLRUN_RAISE_ON_ERROR=false MLRUN_RELEASE_NOTES_OUTPUT_FILE=release_notes.md MLRUN_SKIP_CLONE=true
-        env:
-          INPUT_PREVIOUS_VERSION: ${{ github.event.inputs.previous_version }}
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-      - name: resolve release notes
-        id: resolve-release-notes
-        run: |
-          echo "body<<EOF" >> $GITHUB_OUTPUT
-          cat release_notes.md >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-      - uses: ncipollo/release-action@v1
-        with:
-          tag: v${{ github.event.inputs.version }}
-          commit: ${{ github.ref_name }}
-          token: ${{ secrets.RELEASE_GITHUB_ACCESS_TOKEN }}
-          allowUpdates: true
-          prerelease: ${{ github.event.inputs.pre_release }}
-          body: ${{ steps.resolve-release-notes.outputs.body }}
+#   update-release-notes:
+#     name: Update release notes
+#     runs-on: ubuntu-latest
+#     if: github.event.inputs.generate_release_notes == 'true'
+#     needs: create-releases
+#     steps:
+#       - uses: actions/checkout@v3
+#         with:
+#           fetch-depth: 0
+#       - uses: actions/setup-python@v4
+#         with:
+#           python-version: 3.9
+#           cache: pip
+#       - name: Install dependencies
+#         run: |
+#           python -m pip install --upgrade pip
+#           pip install -r automation/requirements.txt -r dev-requirements.txt && pip install -e .
+#       - name: Generate release notes
+#         id: release-notes
+#         run: |
+#           make release-notes MLRUN_OLD_VERSION="v$INPUT_PREVIOUS_VERSION" MLRUN_VERSION="v$INPUT_VERSION" MLRUN_RELEASE_BRANCH=${{ github.ref_name }} MLRUN_RAISE_ON_ERROR=false MLRUN_RELEASE_NOTES_OUTPUT_FILE=release_notes.md MLRUN_SKIP_CLONE=true
+#         env:
+#           INPUT_PREVIOUS_VERSION: ${{ github.event.inputs.previous_version }}
+#           INPUT_VERSION: ${{ github.event.inputs.version }}
+#       - name: resolve release notes
+#         id: resolve-release-notes
+#         run: |
+#           echo "body<<EOF" >> $GITHUB_OUTPUT
+#           cat release_notes.md >> $GITHUB_OUTPUT
+#           echo "EOF" >> $GITHUB_OUTPUT
+#       - uses: ncipollo/release-action@v1
+#         with:
+#           tag: v${{ github.event.inputs.version }}
+#           commit: ${{ github.ref_name }}
+#           token: ${{ secrets.RELEASE_GITHUB_ACCESS_TOKEN }}
+#           allowUpdates: true
+#           prerelease: ${{ github.event.inputs.pre_release }}
+#           body: ${{ steps.resolve-release-notes.outputs.body }}
   
   
   update-tutorials:
     name: Create tutorials tar
-    needs: create-releases
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
