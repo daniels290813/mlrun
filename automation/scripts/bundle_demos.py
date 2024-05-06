@@ -7,6 +7,7 @@ import shutil
 repos = [
     {"url": "https://github.com/mlrun/demo-azure-ML.git", "name": "demo-azure-ML"},
     {"url": "https://github.com/mlrun/demo-fraud.git", "name": "demo-fraud"},
+    {"url": "https://github.com/mlrun/demo-ssfraud.git", "name": "demo-fraudss"},
     # Add more repositories as needed
 ]
 
