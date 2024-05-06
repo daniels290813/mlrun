@@ -6,8 +6,8 @@ import shutil
 # List of repositories to archive
 repos = [
     {"url": "https://github.com/mlrun/demo-azure-ML.git", "name": "demo-azure-ML"},
-    {"url": "https://github.com/mlrun/demo-fraud.git", "name": "demo-fraud"},
     {"url": "https://github.com/mlrun/demo-ssfraud.git", "name": "demo-fraudss"},
+    {"url": "https://github.com/mlrun/demo-fraud.git", "name": "demo-fraud"},
     # Add more repositories as needed
 ]
 
