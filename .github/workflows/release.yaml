@@ -283,6 +283,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: install prerequisits
+        run: |
+          pip install python-git
       - name: Create tutorials tar
         run: |
           echo $(pwd)
