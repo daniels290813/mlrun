@@ -295,5 +295,5 @@ jobs:
           allowUpdates: true
           tag: v${{ needs.prepare-inputs.outputs.version }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: demos.tar
+          artifacts: mlrun-demos.tar
           prerelease: ${{ needs.prepare-inputs.outputs.is_stable_version == 'false' }}
