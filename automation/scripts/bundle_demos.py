@@ -1,13 +1,28 @@
+# Copyright 2019 Iguazio
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 import os
 import tarfile
 from git import Repo
 import shutil
+import requests
 
 # List of repositories to archive
 repos = [
     {"url": "https://github.com/mlrun/demo-azure-ML.git", "name": "demo-azure-ML"},
-    {"url": "https://github.com/mlrun/demo-ssfraud.git", "name": "demo-fraudss"},
     {"url": "https://github.com/mlrun/demo-fraud.git", "name": "demo-fraud"},
+    {"url": "https://github.com/mlrun/demo-mask-detection.git", "name": "demo-mask-detection"},
     # Add more repositories as needed
 ]
 
@@ -29,11 +44,16 @@ for repo_info in repos:
     except Exception as e:
         print(f"could not clone repo {repo_url}")
         print(e)
+
+# Getting update_demos.sh script
+r = requests.get('https://raw.githubusercontent.com/v3io/tutorials/development/update_demos.sh')  
+with open('demos/update_demos.sh', 'wb') as f:
+    f.write(r.content)
     
 # Create a tar archive of the temporary directory
 with tarfile.open("demos.tar", "w") as tar:
     tar.add(temp_dir, arcname=os.path.basename(temp_dir))
-
+    
 print("Archive created successfully!")
 
 # Cleanup: Delete the temporary directory
