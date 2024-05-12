@@ -51,7 +51,7 @@ with open('demos/update_demos.sh', 'wb') as f:
     f.write(r.content)
     
 # Create a tar archive of the temporary directory
-with tarfile.open("demos.tar", "w") as tar:
+with tarfile.open("mlrun-demos.tar", "w") as tar:
     tar.add(temp_dir, arcname=os.path.basename(temp_dir))
     
 print("Archive created successfully!")
