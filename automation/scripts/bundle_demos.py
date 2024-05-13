@@ -46,9 +46,12 @@ for repo_info in repos:
         print(e)
 
 # Getting update_demos.sh script
-r = requests.get('https://raw.githubusercontent.com/v3io/tutorials/development/update_demos.sh')  
-with open('demos/update_demos.sh', 'wb') as f:
-    f.write(r.content)
+# r = requests.get('https://raw.githubusercontent.com/v3io/tutorials/development/update_demos.sh')  
+# with open('demos/update_demos.sh', 'wb') as f:
+#     f.write(r.content)
+
+shutil.copyfile('automation/scripts/update_demos.sh', 'demos/update_demos.sh')
+print(os.listdir('demos'))
     
 # Create a tar archive of the temporary directory
 with tarfile.open("mlrun-demos.tar", "w") as tar:
