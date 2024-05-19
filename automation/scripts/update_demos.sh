@@ -45,7 +45,6 @@ run:
     rm -rf update_demos.sh
     wget https://raw.githubusercontent.com/mlrun/demos/v1.6.0/update_demos.sh
     sh update_demos.sh
-    rm -rf update_demos.sh
     
 Aborting...'
 fi
