@@ -38,9 +38,9 @@ mlrun_version=$(echo "${pip_mlrun##Version: }" | sed 's/\([0-9]\)rc/\1-rc/')
 echo "Detected MLRun version: ${mlrun_version}"
 
 # Verifying mlrun >= 1.7
-tag_prefix=`echo ${mlrun_version} | cut -d . -f1-3`
-if [[ "${tag_prefix}" < "1.7.0-rc17" ]]; then
-    error_exit 'MLRun version must be 1.7.0-rc17 or above, for older updates
+tag_prefix=`echo ${mlrun_version} | cut -d . -f1-2`
+if [[ "${tag_prefix}" < "1.7" ]]; then
+    error_exit 'MLRun version must be 1.7.0 or above, for older updates
 run:
     rm -rf update_demos.sh
     wget https://raw.githubusercontent.com/mlrun/demos/v1.6.0/update_demos.sh
