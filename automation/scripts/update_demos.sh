@@ -62,9 +62,9 @@ cp -r "${demos_dir}/." "${old_demos_dir}" && rm -rf "${demos_dir}"
 tar_url=$(echo "https://github.com/mlrun/mlrun/releases/download/v${mlrun_version}/mlrun-demos.tar")
 
 # Downloading & extracting tar 
-wget ${tar_url} 
+wget ${tar_url} -O "${HOME}/mlrun-demos.tar"
 mkdir ${demos_dir}
-tar -xvf mlrun-demos.tar -C ${demos_dir} --strip-components 1
+tar -xvf "${HOME}/mlrun-demos.tar" -C ${demos_dir} --strip-components 1
 
 # Cleaning
-rm -rf demos.tar
+rm -rf "${HOME}/mlrun-demos.tar"
