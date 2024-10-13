@@ -258,7 +258,7 @@ jobs:
 #
   update-tutorials:
     name: Bundle tutorials
-    needs: [ prepare-inputs, create-releases ]
+    needs: [ prepare-inputs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -279,7 +279,7 @@ jobs:
           
   update-demos:
     name: Bundle demos
-    needs: [ prepare-inputs, create-releases ]
+    needs: [ prepare-inputs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
