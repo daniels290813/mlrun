@@ -290,6 +290,7 @@ jobs:
           pip install gitpython
       - name: Create mlrun demos tar
         run: |
+          source venv/bin/activate
           python automation/scripts/bundle_demos.py
       - name: Add mlrun-demos tar to release
         uses: ncipollo/release-action@v1
