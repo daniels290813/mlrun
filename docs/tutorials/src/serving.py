@@ -85,6 +85,8 @@ def init_context(context):
 
 def handler(context, event):
     # Unpack payload
+    if event.path == "/metrics":
+        return None
     question_json = json.loads(event.body)
     question = question_json["question"]
     topic = question_json["topic"]
@@ -106,7 +108,7 @@ def handler(context, event):
     prompt = PROMPT_TEMPLATE.format(question=question, context=q_context)
 
     # Generate result
-    resp = context.user_data.pipe(prompt)
+    resp = context.user_data.pipe(prompt,do_sample=True,temperature=0.3)
 
     generated = resp[0]["generated_text"][len(prompt) :].split("#")[0]
 
