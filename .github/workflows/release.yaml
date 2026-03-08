@@ -159,6 +159,7 @@ jobs:
           git clone --depth 1 --branch development https://github.com/v3io/tutorials.git /tmp/tutorials
           cp /tmp/tutorials/welcome.ipynb docs/
           cp /tmp/tutorials/README.md docs/
+          mkdir -p docs/assets/images
           cp -r /tmp/tutorials/assets/images docs/assets/images
           tar -cvf mlrun-tutorials.tar docs/tutorials docs/README.md docs/welcome.ipynb docs/assets/images
           rm -rf docs/welcome.ipynb docs/README.md docs/assets/images
