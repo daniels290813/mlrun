@@ -26,7 +26,7 @@ from base64 import b64decode
 from copy import deepcopy
 from os import environ, makedirs, path
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 import nuclio
 import yaml
@@ -118,7 +118,25 @@ def function_to_module(code="", workdir=None, secrets=None, silent=False):
         raise ValueError("nothing to run, specify command or function")
 
     command = os.path.join(workdir or "", command)
-    mod_name = mlrun.utils.helpers.get_module_name_from_path(command)
+
+    source_file_path_object, working_dir_path_object = (
+        mlrun.utils.helpers.get_source_and_working_dir_paths(command)
+    )
+    if source_file_path_object.is_relative_to(working_dir_path_object):
+        mod_name = mlrun.utils.helpers.get_relative_module_name_from_path(
+            source_file_path_object, working_dir_path_object
+        )
+    elif source_file_path_object.is_relative_to(
+        pathlib.Path(tempfile.gettempdir()).resolve()
+    ):
+        mod_name = Path(command).stem
+    else:
+        raise mlrun.errors.MLRunRuntimeError(
+            f"Cannot run source file '{command}': it must be located either under the current working "
+            f"directory ('{working_dir_path_object}') or the system temporary directory ('{tempfile.gettempdir()}'). "
+            f"This is required when running with local=True."
+        )
+
     spec = imputil.spec_from_file_location(mod_name, command)
     if spec is None:
         raise OSError(f"cannot import from {command!r}")
@@ -201,7 +219,7 @@ def load_func_code(command="", workdir=None, secrets=None, name="name"):
 def get_or_create_ctx(
     name: str,
     event=None,
-    spec: Optional[dict] = None,
+    spec: dict | None = None,
     with_env: bool = True,
     rundb: Union[str, "mlrun.db.RunDBInterface"] = "",
     project: str = "",
@@ -240,7 +258,7 @@ def get_or_create_ctx(
         # access input metadata, values, files, and secrets (passwords)
         print(f"Run: {context.name} (uid={context.uid})")
         print(f"Params: p1={p1}, p2={p2}")
-        print(f'accesskey = {context.get_secret("ACCESS_KEY")}')
+        print(f"accesskey = {context.get_secret('ACCESS_KEY')}")
         input_str = context.get_input("infile.txt").get()
         print(f"file: {input_str}")
 
@@ -255,7 +273,9 @@ def get_or_create_ctx(
         context.log_artifact(
             "model.txt", body=b"abc is 123", labels={"framework": "xgboost"}
         )
-        context.log_artifact("results.html", body=b"<b> Some HTML <b>", viewer="web-app")
+        context.log_artifact(
+            "results.html", body=b"<b> Some HTML <b>", viewer="web-app"
+        )
 
     """
     if global_context.get() and not spec and not event:
@@ -272,7 +292,7 @@ def get_or_create_ctx(
     elif with_env and config:
         newspec = config
 
-    if isinstance(newspec, (RunObject, RunTemplate)):
+    if isinstance(newspec, RunObject | RunTemplate):
         newspec = newspec.to_dict()
 
     if newspec and not isinstance(newspec, dict):
@@ -327,7 +347,7 @@ def get_or_create_ctx(
 def import_function(url="", secrets=None, db="", project=None, new_name=None):
     """Create function object from DB or local/remote YAML file
 
-    Functions can be imported from function repositories (mlrun Function Hub (formerly Marketplace) or local db),
+    Functions can be imported from function repositories (MLRun Hub) or local db),
     or be read from a remote URL (http(s), s3, git, v3io, ..) containing the function YAML
 
     special URLs::
@@ -343,7 +363,7 @@ def import_function(url="", secrets=None, db="", project=None, new_name=None):
             "https://raw.githubusercontent.com/org/repo/func.yaml"
         )
 
-    :param url: path/url to Function Hub, db or function YAML file
+    :param url: path/url to MLRun Hub, db or function YAML file
     :param secrets: optional, credentials dict for DB or URL (s3, v3io, ...)
     :param db: optional, mlrun api/db path
     :param project: optional, target project for the function
@@ -375,7 +395,7 @@ def import_function(url="", secrets=None, db="", project=None, new_name=None):
 
 def import_function_to_dict(
     url: str,
-    secrets: Optional[dict] = None,
+    secrets: dict | None = None,
 ) -> dict:
     """Load function spec from local/remote YAML file"""
     obj = get_object(url, secrets)
@@ -443,19 +463,19 @@ def import_function_to_dict(
 
 
 def new_function(
-    name: Optional[str] = "",
-    project: Optional[str] = "",
-    tag: Optional[str] = "",
-    kind: Optional[str] = "",
-    command: Optional[str] = "",
-    image: Optional[str] = "",
-    args: Optional[list] = None,
-    runtime: Optional[Union[mlrun.runtimes.BaseRuntime, dict]] = None,
-    mode: Optional[str] = None,
-    handler: Optional[str] = None,
-    source: Optional[str] = None,
-    requirements: Optional[list[str]] = None,
-    kfp: Optional[bool] = None,
+    name: str | None = "",
+    project: str | None = "",
+    tag: str | None = "",
+    kind: str | None = "",
+    command: str | None = "",
+    image: str | None = "",
+    args: list | None = None,
+    runtime: Union[mlrun.runtimes.BaseRuntime, dict] | None = None,
+    mode: str | None = None,
+    handler: str | None = None,
+    source: str | None = None,
+    requirements: list[str] | None = None,
+    kfp: bool | None = None,
     requirements_file: str = "",
 ):
     """Create a new ML function from base properties
@@ -537,6 +557,7 @@ def new_function(
 
     # make sure function name is valid
     name = mlrun.utils.helpers.normalize_name(name)
+    mlrun.utils.helpers.validate_function_name(name)
 
     runner.metadata.name = name
     runner.metadata.project = (
@@ -576,6 +597,7 @@ def new_function(
         )
 
     runner.prepare_image_for_deploy()
+
     return runner
 
 
@@ -599,22 +621,22 @@ def _process_runtime(command, runtime, kind):
 
 
 def code_to_function(
-    name: Optional[str] = "",
-    project: Optional[str] = "",
-    tag: Optional[str] = "",
-    filename: Optional[str] = "",
-    handler: Optional[str] = "",
-    kind: Optional[str] = "",
-    image: Optional[str] = None,
-    code_output: Optional[str] = "",
+    name: str | None = "",
+    project: str | None = "",
+    tag: str | None = "",
+    filename: str | None = "",
+    handler: str | None = "",
+    kind: str | None = "",
+    image: str | None = None,
+    code_output: str | None = "",
     embed_code: bool = True,
-    description: Optional[str] = "",
-    requirements: Optional[Union[str, list[str]]] = None,
-    categories: Optional[list[str]] = None,
-    labels: Optional[dict[str, str]] = None,
-    with_doc: Optional[bool] = True,
-    ignored_tags: Optional[str] = None,
-    requirements_file: Optional[str] = "",
+    description: str | None = "",
+    requirements: list[str] | None = None,
+    categories: list[str] | None = None,
+    labels: dict[str, str] | None = None,
+    with_doc: bool | None = True,
+    ignored_tags: str | None = None,
+    requirements_file: str | None = "",
 ) -> Union[
     MpiRuntimeV1,
     RemoteRuntime,
@@ -672,7 +694,7 @@ def code_to_function(
     :param description:  short function description, defaults to ''
     :param requirements: a list of python packages
     :param requirements_file: path to a python requirements file
-    :param categories:   list of categories for mlrun Function Hub, defaults to None
+    :param categories:   list of categories for MLRun Hub, defaults to None
     :param labels:       name/value pairs dict to tag the function with useful metadata, defaults to None
     :param with_doc:     indicates whether to document the function parameters, defaults to True
     :param ignored_tags: notebook cells to ignore when converting notebooks to py code (separated by ';')
@@ -715,7 +737,6 @@ def code_to_function(
         )
 
     """
-    filebase, _ = path.splitext(path.basename(filename))
     ignored_tags = ignored_tags or mlconf.ignored_notebook_tags
 
     def add_name(origin, name=""):
@@ -757,8 +778,7 @@ def code_to_function(
         and (not filename or filename.endswith(".ipynb"))
     ):
         raise ValueError(
-            "A valid code file must be specified "
-            "when not using the embed_code option"
+            "A valid code file must be specified when not using the embed_code option"
         )
 
     if kind == RuntimeKinds.databricks and not embed_code:
@@ -780,6 +800,7 @@ def code_to_function(
         kind=sub_kind,
         ignored_tags=ignored_tags,
     )
+
     spec["spec"]["env"].append(
         {
             "name": "MLRUN_HTTPDB__NUCLIO__EXPLICIT_ACK",
@@ -832,6 +853,7 @@ def code_to_function(
         runtime.spec.build.code_origin = code_origin
         runtime.spec.build.origin_filename = filename or (name + ".ipynb")
         update_common(runtime, spec)
+
         return runtime
 
     if kind is None or kind in ["", "Function"]:
@@ -845,6 +867,7 @@ def code_to_function(
 
     if not name:
         raise ValueError("name must be specified")
+
     h = get_in(spec, "spec.handler", "").split(":")
     runtime.handler = h[0] if len(h) <= 1 else h[1]
     runtime.metadata = get_in(spec, "spec.metadata")
@@ -1018,10 +1041,10 @@ def terminate_pipeline(
 def wait_for_pipeline_completion(
     run_id,
     timeout=60 * 60,
-    expected_statuses: Optional[list[str]] = None,
+    expected_statuses: list[str] | None = None,
     namespace=None,
     remote=True,
-    project: Optional[str] = None,
+    project: str | None = None,
 ):
     """Wait for Pipeline status, timeout in sec
 
@@ -1069,8 +1092,7 @@ def wait_for_pipeline_completion(
 
         if mldb.kind != "http":
             raise ValueError(
-                "get pipeline requires access to remote api-service"
-                ", set the dbpath url"
+                "get pipeline requires access to remote api-service, set the dbpath url"
             )
 
         resp = retry_until_successful(
@@ -1116,7 +1138,7 @@ def get_pipeline(
     format_: Union[
         str, mlrun.common.formatters.PipelineFormat
     ] = mlrun.common.formatters.PipelineFormat.summary,
-    project: Optional[str] = None,
+    project: str | None = None,
     remote: bool = True,
 ):
     """Get Pipeline status
@@ -1171,7 +1193,7 @@ def list_pipelines(
     namespace=None,
     project="*",
     format_: mlrun.common.formatters.PipelineFormat = mlrun.common.formatters.PipelineFormat.metadata_only,
-) -> tuple[int, Optional[int], list[dict]]:
+) -> tuple[int, int | None, list[dict]]:
     """List pipelines
 
     :param full:       Deprecated, use `format_` instead. if True will set `format_` to full, otherwise `format_` will
@@ -1214,7 +1236,7 @@ def get_model_provider(
     url,
     secrets=None,
     db=None,
-    default_invoke_kwargs: Optional[dict] = None,
+    default_invoke_kwargs: dict | None = None,
     raise_missing_schema_exception=True,
 ) -> ModelProvider:
     """get mlrun dataitem object (from path/url)"""

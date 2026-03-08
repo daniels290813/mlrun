@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import http
-from typing import Optional
 
 import fastapi
 import semver
@@ -42,7 +41,7 @@ router = fastapi.APIRouter()
         http.HTTPStatus.ACCEPTED.value: {},
     },
 )
-def create_project(
+async def create_project(
     project: mlrun.common.schemas.Project,
     response: fastapi.Response,
     # TODO: we're in a http request context here, therefore it doesn't make sense that by default it will hold the
@@ -55,15 +54,27 @@ def create_project(
         framework.api.deps.get_db_session
     ),
 ):
-    project, is_running_in_background = get_project_member().create_project(
+    if mlrun.mlconf.is_iguazio_v4_mode():
+        await framework.utils.auth.verifier.AuthVerifier().query_global_resource_permissions(
+            mlrun.common.schemas.AuthorizationResourceTypes.project_global,
+            mlrun.common.schemas.AuthorizationAction.create,
+            auth_info,
+        )
+    project, is_running_in_background = await run_in_threadpool(
+        get_project_member().create_project,
         db_session,
         project,
-        auth_info.projects_role,
-        auth_info.session,
+        auth_info,
         wait_for_completion=wait_for_completion,
     )
     if is_running_in_background:
         return fastapi.Response(status_code=http.HTTPStatus.ACCEPTED.value)
+
+    await framework.utils.auth.verifier.AuthVerifier().ensure_project_permissions(
+        project.metadata.name,
+        auth_info,
+    )
+
     response.status_code = http.HTTPStatus.CREATED.value
     return project
 
@@ -88,17 +99,23 @@ async def store_project(
         framework.api.deps.get_db_session
     ),
 ):
+    await _ensure_project_create_or_update_permissions(db_session, name, auth_info)
     project, is_running_in_background = await run_in_threadpool(
         get_project_member().store_project,
         db_session,
         name,
         project,
-        auth_info.projects_role,
-        auth_info.session,
+        auth_info,
         wait_for_completion=wait_for_completion,
     )
     if is_running_in_background:
         return fastapi.Response(status_code=http.HTTPStatus.ACCEPTED.value)
+
+    await framework.utils.auth.verifier.AuthVerifier().ensure_project_permissions(
+        project.metadata.name,
+        auth_info,
+    )
+
     return project
 
 
@@ -109,7 +126,7 @@ async def store_project(
         http.HTTPStatus.ACCEPTED.value: {},
     },
 )
-def patch_project(
+async def patch_project(
     project: dict,
     name: str,
     patch_mode: mlrun.common.schemas.PatchMode = fastapi.Header(
@@ -126,13 +143,23 @@ def patch_project(
         framework.api.deps.get_db_session
     ),
 ):
-    project, is_running_in_background = get_project_member().patch_project(
+    # skip permission check if it's the leader in iguazio v3 mode
+    if (
+        mlrun.mlconf.is_iguazio_v4_mode()
+        or not framework.utils.helpers.is_request_from_leader(auth_info.projects_role)
+    ):
+        await framework.utils.auth.verifier.AuthVerifier().query_project_permissions(
+            name,
+            mlrun.common.schemas.AuthorizationAction.update,
+            auth_info,
+        )
+    project, is_running_in_background = await run_in_threadpool(
+        get_project_member().patch_project,
         db_session,
         name,
         project,
         patch_mode,
-        auth_info.projects_role,
-        auth_info.session,
+        auth_info,
         wait_for_completion=wait_for_completion,
     )
     if is_running_in_background:
@@ -157,11 +184,14 @@ async def get_project(
         get_project_member().get_project,
         db_session,
         name,
-        auth_info.session,
+        auth_info,
         format_=format_,
     )
-    # skip permission check if it's the leader
-    if not framework.utils.helpers.is_request_from_leader(auth_info.projects_role):
+    # skip permission check if it's the leader in iguazio v3 mode
+    if (
+        mlrun.mlconf.is_iguazio_v4_mode()
+        or not framework.utils.helpers.is_request_from_leader(auth_info.projects_role)
+    ):
         await framework.utils.auth.verifier.AuthVerifier().query_project_permissions(
             name,
             mlrun.common.schemas.AuthorizationAction.read,
@@ -198,11 +228,22 @@ async def delete_project(
     # check if project exists
     try:
         project = await run_in_threadpool(
-            get_project_member().get_project, db_session, name, auth_info.session
+            get_project_member().get_project, db_session, name, auth_info
         )
     except mlrun.errors.MLRunNotFoundError:
         logger.info("Project not found, nothing to delete", project=name)
         return fastapi.Response(status_code=http.HTTPStatus.NO_CONTENT.value)
+
+    # skip permission check if it's the leader in iguazio v3 mode
+    if (
+        mlrun.mlconf.is_iguazio_v4_mode()
+        or not framework.utils.helpers.is_request_from_leader(auth_info.projects_role)
+    ):
+        await framework.utils.auth.verifier.AuthVerifier().query_project_permissions(
+            name,
+            mlrun.common.schemas.AuthorizationAction.delete,
+            auth_info,
+        )
 
     # delete project can be responsible for deleting schedules. Schedules are running only on chief,
     # that is why we re-route requests to chief
@@ -264,7 +305,6 @@ async def delete_project(
             db_session,
             name,
             deletion_strategy,
-            auth_info.projects_role,
             auth_info,
             wait_for_completion=wait_for_completion,
         )
@@ -316,7 +356,7 @@ async def list_projects(
     format_: mlrun.common.formatters.ProjectFormat = fastapi.Query(
         mlrun.common.formatters.ProjectFormat.full, alias="format"
     ),
-    owner: Optional[str] = None,
+    owner: str | None = None,
     labels: list[str] = fastapi.Query(None, alias="label"),
     state: mlrun.common.schemas.ProjectState = None,
     auth_info: mlrun.common.schemas.AuthInfo = fastapi.Depends(
@@ -327,17 +367,19 @@ async def list_projects(
     ),
 ):
     allowed_project_names = None
-    # skip permission check if it's the leader
-    if not framework.utils.helpers.is_request_from_leader(auth_info.projects_role):
+    # skip permission check if it's the leader in iguazio v3 mode
+    if (
+        mlrun.mlconf.is_iguazio_v4_mode()
+        or not framework.utils.helpers.is_request_from_leader(auth_info.projects_role)
+    ):
         projects_output = await run_in_threadpool(
             get_project_member().list_projects,
             db_session,
+            auth_info,
             owner,
             mlrun.common.formatters.ProjectFormat.name_only,
             labels,
             state,
-            auth_info.projects_role,
-            auth_info.session,
         )
         allowed_project_names = await framework.utils.auth.verifier.AuthVerifier().filter_projects_by_permissions(
             projects_output.projects,
@@ -346,12 +388,11 @@ async def list_projects(
     return await run_in_threadpool(
         get_project_member().list_projects,
         db_session,
+        auth_info,
         owner,
         format_,
         labels,
         state,
-        auth_info.projects_role,
-        auth_info.session,
         allowed_project_names,
     )
 
@@ -360,7 +401,7 @@ async def list_projects(
     "/project-summaries", response_model=mlrun.common.schemas.ProjectSummariesOutput
 )
 async def list_project_summaries(
-    owner: Optional[str] = None,
+    owner: str | None = None,
     labels: list[str] = fastapi.Query(None, alias="label"),
     state: mlrun.common.schemas.ProjectState = None,
     auth_info: mlrun.common.schemas.AuthInfo = fastapi.Depends(
@@ -373,16 +414,18 @@ async def list_project_summaries(
     projects_output = await run_in_threadpool(
         get_project_member().list_projects,
         db_session,
+        auth_info,
         owner,
         mlrun.common.formatters.ProjectFormat.name_only,
         labels,
         state,
-        auth_info.projects_role,
-        auth_info.session,
     )
     allowed_project_names = projects_output.projects
-    # skip permission check if it's the leader
-    if not framework.utils.helpers.is_request_from_leader(auth_info.projects_role):
+    # skip permission check if it's the leader in iguazio v3 mode
+    if (
+        mlrun.mlconf.is_iguazio_v4_mode()
+        or not framework.utils.helpers.is_request_from_leader(auth_info.projects_role)
+    ):
         auth_verifier = framework.utils.auth.verifier.AuthVerifier()
         allowed_project_names = await auth_verifier.filter_project_resources_by_permissions(
             resource_type=mlrun.common.schemas.AuthorizationResourceTypes.project_summaries,
@@ -396,11 +439,10 @@ async def list_project_summaries(
         )
     return await get_project_member().list_project_summaries(
         db_session,
+        auth_info,
         owner,
         labels,
         state,
-        auth_info.projects_role,
-        auth_info.session,
         allowed_project_names,
     )
 
@@ -418,10 +460,13 @@ async def get_project_summary(
     ),
 ):
     project_summary = await get_project_member().get_project_summary(
-        db_session, name, auth_info.session
+        db_session, name, auth_info
     )
-    # skip permission check if it's the leader
-    if not framework.utils.helpers.is_request_from_leader(auth_info.projects_role):
+    # skip permission check if it's the leader in iguazio v3 mode
+    if (
+        mlrun.mlconf.is_iguazio_v4_mode()
+        or not framework.utils.helpers.is_request_from_leader(auth_info.projects_role)
+    ):
         await framework.utils.auth.verifier.AuthVerifier().query_project_permissions(
             name,
             mlrun.common.schemas.AuthorizationAction.read,
@@ -463,13 +508,14 @@ async def load_project(
         spec=mlrun.common.schemas.ProjectSpec(source=url),
     )
 
+    await _ensure_project_create_or_update_permissions(db_session, name, auth_info)
+
     # Ensure the project exists before calling the remote load_project function
     project, _ = await fastapi.concurrency.run_in_threadpool(
         get_project_member().create_project,
         db_session=db_session,
         project=project,
-        projects_role=auth_info.projects_role,
-        leader_session=auth_info.session,
+        auth_info=auth_info,
     )
 
     # Storing secrets in project
@@ -512,3 +558,44 @@ async def load_project(
         project=project,
     )
     return {"data": run.to_dict()}
+
+
+async def _ensure_project_create_or_update_permissions(
+    db_session: sqlalchemy.orm.Session,
+    project_name: str,
+    auth_info: mlrun.common.schemas.AuthInfo,
+):
+    """Ensure create or update permissions based on project existence."""
+    # Only check leader header in iguazio v3
+    if (
+        not mlrun.mlconf.is_iguazio_v4_mode()
+        and framework.utils.helpers.is_request_from_leader(auth_info.projects_role)
+    ):
+        return
+
+    try:
+        await run_in_threadpool(
+            get_project_member().get_project,
+            db_session,
+            project_name,
+            auth_info,
+            format_=mlrun.common.formatters.ProjectFormat.name_only,
+        )
+        project_exists = True
+    except mlrun.errors.MLRunNotFoundError:
+        project_exists = False
+
+    if project_exists:
+        await framework.utils.auth.verifier.AuthVerifier().query_project_permissions(
+            project_name, mlrun.common.schemas.AuthorizationAction.update, auth_info
+        )
+        return
+
+    # In Iguazio v4 mode, mlrun is the project leader and main entrypoint so we must ensure
+    # that the user has create permissions for projects.
+    if mlrun.mlconf.is_iguazio_v4_mode():
+        await framework.utils.auth.verifier.AuthVerifier().query_global_resource_permissions(
+            mlrun.common.schemas.AuthorizationResourceTypes.project_global,
+            mlrun.common.schemas.AuthorizationAction.create,
+            auth_info,
+        )

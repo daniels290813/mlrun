@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Optional
 
 
 def base_requirements() -> list[str]:
@@ -60,8 +59,8 @@ def extra_requirements() -> dict[str, list[str]]:
             # because confluent kafka supports avro format by default
             "avro~=1.11",
         ],
+        "rabbitmq": ["pika~=1.3"],
         "redis": ["redis~=4.3"],
-        "mlflow": ["mlflow~=2.22"],
         "databricks-sdk": ["databricks-sdk~=0.20.0"],
         "sqlalchemy": ["sqlalchemy~=2.0"],
         "dask": [
@@ -69,15 +68,11 @@ def extra_requirements() -> dict[str, list[str]]:
             # which can cause incompatibilities between the client and the Dask scheduler/worker.
             # (both must be the same version)
             # Reference: https://blog.dask.org/2023/04/14/scheduler-environment-requirements
-            # Note: dask 2023 does not work on Python 3.11, and dask 2024 requires dependencies
-            # that MLRun with Python 3.9 cannot support.
-            'dask~=2023.12.1; python_version < "3.11"',
-            'dask==2024.8; python_version >= "3.11"',
-            'distributed~=2023.12.1; python_version < "3.11"',
-            'distributed==2024.8; python_version >= "3.11"',
+            "dask==2024.8",
+            "distributed==2024.8",
         ],
         "alibaba-oss": ["ossfs==2025.5.0", "oss2==2.18.4"],
-        "tdengine": ["taos-ws-py==0.3.2"],
+        "timescaledb": ["psycopg[binary,pool]~=3.2"],
         "snowflake": ["snowflake-connector-python~=3.7"],
     }
 
@@ -87,7 +82,9 @@ def extra_requirements() -> dict[str, list[str]]:
     extras_require.update(
         {
             "dev-postgres": ["pytest-mock-resources[postgres]~=2.12"],
-            "kfp18": ["mlrun_pipelines_kfp_v1_8[kfp]>=0.5.7"],
+            "kfp18": ["mlrun_pipelines_kfp_v1_8[kfp]~=0.6.0"],
+            "mlflow": ["mlflow~=3.0"],
+            "ig4": ["iguazio~=0.0.1"],
             # TODO uncomment when KFP 1.8 support is removed
             # "kfp2": ["mlrun_pipelines_kfp_v2[kfp]>=0.5.0 ; python_version >= '3.11'"],
             "api": api_deps,
@@ -117,9 +114,7 @@ def _extract_package_from_egg(line: str) -> str:
     return line
 
 
-def _load_dependencies_from_file(
-    path: str, parent_dir: Optional[str] = None
-) -> list[str]:
+def _load_dependencies_from_file(path: str, parent_dir: str | None = None) -> list[str]:
     """Load dependencies from requirements file"""
     parent_dir = parent_dir or os.path.dirname(__file__)
     with open(f"{parent_dir}/{path}") as fp:
@@ -131,10 +126,10 @@ def _load_dependencies_from_file(
 
 
 def _get_extra_dependencies(
-    include: Optional[list[str]] = None,
-    exclude: Optional[list[str]] = None,
-    base_deps: Optional[list[str]] = None,
-    extras_require: Optional[dict[str, list[str]]] = None,
+    include: list[str] | None = None,
+    exclude: list[str] | None = None,
+    base_deps: list[str] | None = None,
+    extras_require: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """Get list of dependencies for given extras categories
 

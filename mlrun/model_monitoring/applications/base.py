@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Optional, Union, cast
 
 import pandas as pd
@@ -195,12 +195,12 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
         write_output: bool,
         application_name: str,
         artifact_path: str,
-        stream_profile: Optional[ds_profile.DatastoreProfile],
+        stream_profile: ds_profile.DatastoreProfile | None,
         project: "mlrun.MlrunProject",
     ) -> Iterator[
         tuple[
             dict[str, list[tuple]],
-            Optional[mm_schedules.ModelMonitoringSchedulesFileApplication],
+            mm_schedules.ModelMonitoringSchedulesFileApplication | None,
         ]
     ]:
         endpoints_output: dict[
@@ -233,7 +233,7 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
         try:
             yield endpoints_output, application_schedules.__enter__()
         finally:
-            if write_output:
+            if write_output and any(endpoints_output.values()):
                 logger.debug(
                     "Pushing model monitoring application job data to the writer stream",
                     passed_stream_profile=str(stream_profile),
@@ -286,17 +286,17 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
     def _handler(
         self,
         context: "mlrun.MLClientCtx",
-        sample_data: Optional[pd.DataFrame] = None,
-        reference_data: Optional[pd.DataFrame] = None,
+        sample_data: pd.DataFrame | None = None,
+        reference_data: pd.DataFrame | None = None,
         endpoints: Union[
             list[tuple[str, str]], list[list[str]], list[str], Literal["all"], None
         ] = None,
-        start: Optional[str] = None,
-        end: Optional[str] = None,
-        base_period: Optional[int] = None,
+        start: str | None = None,
+        end: str | None = None,
+        base_period: int | None = None,
         write_output: bool = False,
         existing_data_handling: ExistingDataHandling = ExistingDataHandling.fail_on_overlap,
-        stream_profile: Optional[ds_profile.DatastoreProfile] = None,
+        stream_profile: ds_profile.DatastoreProfile | None = None,
     ):
         """
         A custom handler that wraps the application's logic implemented in
@@ -344,7 +344,7 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
                 return result
 
             if endpoints is not None:
-                resolved_endpoints = self._validate_endpoints(
+                resolved_endpoints = self._normalize_and_validate_endpoints(
                     project=project, endpoints=endpoints
                 )
                 if (
@@ -390,6 +390,16 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
                         context.log_result(
                             result_key, self._flatten_data_result(result)
                         )
+                # Check if no result was produced for any endpoint (e.g., due to no data in all windows)
+                if not any(endpoints_output.values()):
+                    context.logger.warning(
+                        "No data was found for any of the specified endpoints. "
+                        "No results were produced",
+                        application_name=application_name,
+                        endpoints=endpoints,
+                        start=start,
+                        end=end,
+                    )
             else:
                 result = call_do_tracking(
                     mm_context.MonitoringApplicationContext._from_ml_ctx(
@@ -421,68 +431,96 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
             )
 
     @classmethod
-    def _validate_endpoints(
+    def _normalize_and_validate_endpoints(
         cls,
         project: "mlrun.MlrunProject",
         endpoints: Union[
             list[tuple[str, str]], list[list[str]], list[str], Literal["all"]
         ],
-    ) -> Union[list[tuple[str, str]], list[list[str]]]:
-        if not endpoints:
-            raise mlrun.errors.MLRunValueError(
-                "The endpoints list cannot be empty. If you want to run on all the endpoints, "
-                'use `endpoints="all"`.'
-            )
+    ) -> list[tuple[str, str]]:
+        if isinstance(endpoints, list):
+            if all(
+                isinstance(endpoint, tuple | list) and len(endpoint) == 2
+                for endpoint in endpoints
+            ):
+                # A list of [(name, uid), ...] / [[name, uid], ...] tuples/lists
+                endpoint_uids_to_names = {
+                    endpoint[1]: endpoint[0] for endpoint in endpoints
+                }
+                endpoints_list = project.list_model_endpoints(
+                    uids=list(endpoint_uids_to_names.keys()), latest_only=True
+                ).endpoints
 
-        if isinstance(endpoints, list) and isinstance(endpoints[0], (tuple, list)):
-            return endpoints
-
-        if not (isinstance(endpoints, list) and isinstance(endpoints[0], str)):
-            if isinstance(endpoints, str):
-                if endpoints != "all":
-                    raise mlrun.errors.MLRunValueError(
-                        'A string input for `endpoints` can only be "all" for all the model endpoints in '
-                        "the project. If you want to select a single model endpoint with the given name, "
-                        f'use a list: `endpoints=["{endpoints}"]`.'
+                # Check for missing endpoint uids or name/uid mismatches
+                for endpoint in endpoints_list:
+                    if (
+                        endpoint_uids_to_names[cast(str, endpoint.metadata.uid)]
+                        != endpoint.metadata.name
+                    ):
+                        raise mlrun.errors.MLRunNotFoundError(
+                            "Could not find model endpoint with name "
+                            f"'{endpoint_uids_to_names[cast(str, endpoint.metadata.uid)]}' "
+                            f"and uid '{endpoint.metadata.uid}'"
+                        )
+                missing = set(endpoint_uids_to_names.keys()) - {
+                    cast(str, endpoint.metadata.uid) for endpoint in endpoints_list
+                }
+                if missing:
+                    raise mlrun.errors.MLRunNotFoundError(
+                        "Could not find model endpoints with the following uids: "
+                        f"{missing}"
                     )
-            else:
-                raise mlrun.errors.MLRunValueError(
-                    f"Could not resolve endpoints as list of [(name, uid)], {endpoints=}"
-                )
 
-        if endpoints == "all":
-            endpoint_names = None
-        else:
-            endpoint_names = endpoints
+            elif all(isinstance(endpoint, str) for endpoint in endpoints):
+                # A list of [name, ...] strings
+                endpoint_names = cast(list[str], endpoints)
+                endpoints_list = project.list_model_endpoints(
+                    names=endpoint_names, latest_only=True
+                ).endpoints
 
-        endpoints_list = project.list_model_endpoints(
-            names=endpoint_names, latest_only=True
-        ).endpoints
-
-        cls._check_endpoints_first_request(endpoints_list)
-
-        if endpoints_list:
-            list_endpoints_result = [
-                (endpoint.metadata.name, endpoint.metadata.uid)
-                for endpoint in endpoints_list
-            ]
-            if endpoints != "all":
+                # Check for missing endpoint names
                 missing = set(endpoints) - {
-                    endpoint[0] for endpoint in list_endpoints_result
+                    endpoint.metadata.name for endpoint in endpoints_list
                 }
                 if missing:
                     logger.warning(
                         "Could not list all the required endpoints",
-                        missing_endpoint=missing,
-                        endpoints=list_endpoints_result,
+                        missing_endpoints=missing,
+                        endpoints_list=endpoints_list,
                     )
-            return list_endpoints_result
-        else:
-            if endpoints != "all":
-                err_msg_suffix = f" named '{endpoints}'"
-            raise mlrun.errors.MLRunNotFoundError(
-                f"Did not find any model endpoints {err_msg_suffix}"
+            else:
+                raise mlrun.errors.MLRunValueError(
+                    "Could not resolve the following list as a list of endpoints:\n"
+                    f"{endpoints}\n"
+                    "The list must be either a list of (name, uid) tuples/lists or a list of names."
+                )
+        elif endpoints == "all":
+            endpoints_list = project.list_model_endpoints(latest_only=True).endpoints
+        elif isinstance(endpoints, str):
+            raise mlrun.errors.MLRunValueError(
+                'A string input for `endpoints` can only be "all" for all the model endpoints in '
+                "the project. If you want to select a single model endpoint with the given name, "
+                f'use a list: `endpoints=["{endpoints}"]`.'
             )
+        else:
+            raise mlrun.errors.MLRunValueError(
+                "Could not resolve the `endpoints` parameter. The parameter must be either:\n"
+                "- a list of (name, uid) tuples/lists\n"
+                "- a list of names\n"
+                '- the string "all" for all the model endpoints in the project.'
+            )
+
+        if not endpoints_list:
+            raise mlrun.errors.MLRunNotFoundError(
+                f"Did not find any model endpoints {endpoints=}"
+            )
+
+        cls._check_endpoints_first_request(endpoints_list)
+
+        return [
+            (endpoint.metadata.name, cast(str, endpoint.metadata.uid))
+            for endpoint in endpoints_list
+        ]
 
     @staticmethod
     def _validate_and_get_window_length(
@@ -517,13 +555,12 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
     @staticmethod
     def _validate_monotonically_increasing_data(
         *,
-        application_schedules: Optional[
-            mm_schedules.ModelMonitoringSchedulesFileApplication
-        ],
+        application_schedules: mm_schedules.ModelMonitoringSchedulesFileApplication
+        | None,
         endpoint_id: str,
         start_dt: datetime,
         end_dt: datetime,
-        base_period: Optional[int],
+        base_period: int | None,
         application_name: str,
         existing_data_handling: ExistingDataHandling,
     ) -> datetime:
@@ -576,9 +613,8 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
         project_name: str,
         application_name: str,
         endpoint_ids: list[str],
-        application_schedules: Optional[
-            mm_schedules.ModelMonitoringSchedulesFileApplication
-        ],
+        application_schedules: mm_schedules.ModelMonitoringSchedulesFileApplication
+        | None,
     ) -> None:
         mlrun.get_run_db().delete_model_monitoring_metrics(
             project=project_name,
@@ -594,22 +630,21 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
     def _window_generator(
         cls,
         *,
-        start: Optional[str],
-        end: Optional[str],
-        base_period: Optional[int],
-        application_schedules: Optional[
-            mm_schedules.ModelMonitoringSchedulesFileApplication
-        ],
+        start: str | None,
+        end: str | None,
+        base_period: int | None,
+        application_schedules: mm_schedules.ModelMonitoringSchedulesFileApplication
+        | None,
         endpoint_name: str,
         endpoint_id: str,
         application_name: str,
         existing_data_handling: ExistingDataHandling,
         context: "mlrun.MLClientCtx",
         project: "mlrun.MlrunProject",
-        sample_data: Optional[pd.DataFrame],
+        sample_data: pd.DataFrame | None,
     ) -> Iterator[mm_context.MonitoringApplicationContext]:
         def yield_monitoring_ctx(
-            window_start: Optional[datetime], window_end: Optional[datetime]
+            window_start: datetime | None, window_end: datetime | None
         ) -> Iterator[mm_context.MonitoringApplicationContext]:
             ctx = mm_context.MonitoringApplicationContext._from_ml_ctx(
                 event={
@@ -652,8 +687,8 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
 
         # If `start_dt` and `end_dt` do not include time zone information - change them to UTC
         if (start_dt.tzinfo is None) and (end_dt.tzinfo is None):
-            start_dt = start_dt.replace(tzinfo=timezone.utc)
-            end_dt = end_dt.replace(tzinfo=timezone.utc)
+            start_dt = start_dt.replace(tzinfo=UTC)
+            end_dt = end_dt.replace(tzinfo=UTC)
         elif (start_dt.tzinfo is None) or (end_dt.tzinfo is None):
             raise mlrun.errors.MLRunValueError(
                 "The start and end times must either both include time zone information or both be naive (no time "
@@ -689,12 +724,12 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
     def deploy(
         cls,
         func_name: str,
-        func_path: Optional[str] = None,
-        image: Optional[str] = None,
-        handler: Optional[str] = None,
-        with_repo: Optional[bool] = False,
-        tag: Optional[str] = None,
-        requirements: Optional[Union[str, list[str]]] = None,
+        func_path: str | None = None,
+        image: str | None = None,
+        handler: str | None = None,
+        with_repo: bool | None = False,
+        tag: str | None = None,
+        requirements: Union[str, list[str]] | None = None,
         requirements_file: str = "",
         **application_kwargs,
     ) -> None:
@@ -737,8 +772,8 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
     def _determine_job_name(
         cls,
         *,
-        func_name: Optional[str],
-        class_handler: Optional[str],
+        func_name: str | None,
+        class_handler: str | None,
         handler_to_class: str,
     ) -> str:
         """
@@ -761,10 +796,13 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
                 f"`{mm_constants.APP_NAME_REGEX.pattern}`. "
                 "Please choose another `func_name`."
             )
-        if not job_name.endswith(mm_constants._RESERVED_EVALUATE_FUNCTION_SUFFIX):
-            job_name += mm_constants._RESERVED_EVALUATE_FUNCTION_SUFFIX
+        job_name, was_renamed, suffix = mlrun.utils.helpers.ensure_batch_job_suffix(
+            job_name
+        )
+        if was_renamed:
             mlrun.utils.logger.info(
-                'Changing function name - adding `"-batch"` suffix', func_name=job_name
+                f'Changing function name - adding `"{suffix}"` suffix',
+                func_name=job_name,
             )
 
         return job_name
@@ -773,13 +811,13 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
     def to_job(
         cls,
         *,
-        class_handler: Optional[str] = None,
-        func_path: Optional[str] = None,
-        func_name: Optional[str] = None,
-        tag: Optional[str] = None,
-        image: Optional[str] = None,
-        with_repo: Optional[bool] = False,
-        requirements: Optional[Union[str, list[str]]] = None,
+        class_handler: str | None = None,
+        func_path: str | None = None,
+        func_name: str | None = None,
+        tag: str | None = None,
+        image: str | None = None,
+        with_repo: bool | None = False,
+        requirements: Union[str, list[str]] | None = None,
         requirements_file: str = "",
         project: Optional["mlrun.MlrunProject"] = None,
     ) -> mlrun.runtimes.KubejobRuntime:
@@ -794,7 +832,9 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
             job = ModelMonitoringApplicationBase.to_job(
                 class_handler="package.module.AppClass"
             )
-            job.run(inputs={}, params={}, local=False)  # Add the relevant inputs and params
+            job.run(
+                inputs={}, params={}, local=False
+            )  # Add the relevant inputs and params
 
         Optional inputs:
 
@@ -809,6 +849,11 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
         * ``base_period``, ``int``
         * ``write_output``, ``bool``
         * ``existing_data_handling``, ``str``
+        * ``_init_args``, ``dict`` - the arguments for the application class constructor
+          (equivalent to ``class_arguments``)
+
+        See :py:meth:`~ModelMonitoringApplicationBase.evaluate` for more details
+        about these inputs and params.
 
         For Git sources, add the source archive to the returned job and change the handler:
 
@@ -876,26 +921,27 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
     @classmethod
     def evaluate(
         cls,
-        func_path: Optional[str] = None,
-        func_name: Optional[str] = None,
+        func_path: str | None = None,
+        func_name: str | None = None,
         *,
-        tag: Optional[str] = None,
+        tag: str | None = None,
         run_local: bool = True,
         auto_build: bool = True,
-        sample_data: Optional[Union[pd.DataFrame, str]] = None,
-        reference_data: Optional[Union[pd.DataFrame, str]] = None,
-        image: Optional[str] = None,
-        with_repo: Optional[bool] = False,
-        class_handler: Optional[str] = None,
-        requirements: Optional[Union[str, list[str]]] = None,
+        sample_data: Union[pd.DataFrame, str] | None = None,
+        reference_data: Union[pd.DataFrame, str] | None = None,
+        image: str | None = None,
+        with_repo: bool | None = False,
+        class_handler: str | None = None,
+        class_arguments: dict[str, Any] | None = None,
+        requirements: Union[str, list[str]] | None = None,
         requirements_file: str = "",
         endpoints: Union[list[tuple[str, str]], list[str], Literal["all"], None] = None,
-        start: Optional[datetime] = None,
-        end: Optional[datetime] = None,
-        base_period: Optional[int] = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        base_period: int | None = None,
         write_output: bool = False,
         existing_data_handling: ExistingDataHandling = ExistingDataHandling.fail_on_overlap,
-        stream_profile: Optional[ds_profile.DatastoreProfile] = None,
+        stream_profile: ds_profile.DatastoreProfile | None = None,
     ) -> "mlrun.RunObject":
         """
         Call this function to run the application's
@@ -922,7 +968,10 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
                                   You do not need to have a model endpoint to use this option.
         :param image:             Docker image to run the job on (when running remotely).
         :param with_repo:         Whether to clone the current repo to the build source.
-        :param class_handler:     The relative path to the class, useful when using Git sources or code from images.
+        :param class_handler:     The relative path to the application class, useful when using Git sources or code
+                                  from images.
+        :param class_arguments:   The arguments for the application class constructor. These are passed to the
+                                  class ``__init__``. The values must be JSON-serializable.
         :param requirements:      List of Python requirements to be installed in the image.
         :param requirements_file: Path to a Python requirements file to be installed in the image.
         :param endpoints:         The model endpoints to get the data from. The options are:
@@ -1000,7 +1049,9 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
             project=project,
         )
 
-        params: dict[str, Union[list, str, int, None, ds_profile.DatastoreProfile]] = {}
+        params: dict[
+            str, Union[list, dict, str, int, None, ds_profile.DatastoreProfile]
+        ] = {}
         if endpoints:
             params["endpoints"] = endpoints
             if sample_data is None:
@@ -1035,6 +1086,9 @@ class ModelMonitoringApplicationBase(MonitoringApplicationToDict, ABC):
                     "Passing a `stream_profile` is relevant only when writing the outputs"
                 )
         params["stream_profile"] = stream_profile
+
+        if class_arguments:
+            params["_init_args"] = class_arguments
 
         inputs: dict[str, str] = {}
         for data, identifier in [

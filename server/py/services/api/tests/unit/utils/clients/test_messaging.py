@@ -78,12 +78,22 @@ def test_sync_delete_request(
     api_url = "http://test/success-service/v1"
     requests_mock.delete(f"{api_url}/resource", status_code=http.HTTPStatus.NO_CONTENT)
     response = messaging_client.delete(
-        path="/resource", headers={"authorization": "Bearer test"}
+        path="/resource",
+        headers={
+            mlrun.common.schemas.HeaderNames.authorization: (
+                f"{mlrun.common.schemas.AuthorizationHeaderPrefixes.bearer}test"
+            )
+        },
     )
     assert response.status_code == http.HTTPStatus.NO_CONTENT
 
     response = messaging_client.delete(
-        path="resource", headers={"authorization": "Bearer test"}
+        path="resource",
+        headers={
+            mlrun.common.schemas.HeaderNames.authorization: (
+                f"{mlrun.common.schemas.AuthorizationHeaderPrefixes.bearer}test"
+            )
+        },
     )
     assert response.status_code == http.HTTPStatus.NO_CONTENT
 
@@ -118,7 +128,10 @@ async def test_messaging_client_forward_request_with_body(
     )
 
     def _f(*args, **kwargs):
-        assert kwargs["headers"].get("authorization") == "Bearer test"
+        assert (
+            kwargs["headers"].get(mlrun.common.schemas.HeaderNames.authorization)
+            == f"{mlrun.common.schemas.AuthorizationHeaderPrefixes.bearer}test"
+        )
         return aioresponses.CallbackResult(
             status=http.HTTPStatus.CREATED.value,
             payload={"body": "success"},
@@ -193,18 +206,18 @@ def test_sessions_are_different_per_thread():
     def thread_worker(index):
         async def get_session():
             client = framework.utils.clients.messaging.Client()
-            session = await client._resolve_session()
-            session_ids[index] = id(session) if session else None
-            sessions[index] = session
+            async_session = client._async_sessions.get()
+            session_ids[index] = id(async_session) if async_session else None
+            sessions[index] = async_session
             # sleep to ensure multiple threads remain active simultaneously
             time.sleep(2)
+            # close the session after getting it
+            await client._async_sessions.async_close()
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        # close the session before closing the loop
         loop.run_until_complete(get_session())
-        sessions[index].close()
         loop.close()
 
     for i in range(num_threads):
@@ -217,6 +230,27 @@ def test_sessions_are_different_per_thread():
 
     # Ensure all session IDs are unique per thread
     assert None not in session_ids, f"Some sessions were not initialized: {session_ids}"
-    assert (
-        len(set(session_ids)) == num_threads
-    ), f"Sessions should be unique per thread, got: {session_ids}"
+    assert len(set(session_ids)) == num_threads, (
+        f"Sessions should be unique per thread, got: {session_ids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_messaging_client_close_without_exceptions():
+    """Test that closing messaging client sessions doesn't raise exceptions"""
+    client = framework.utils.clients.messaging.Client()
+
+    # Get async session (creates it)
+    async_session = client._async_sessions.get()
+    assert async_session is not None
+
+    # Close should not raise any exceptions (async)
+    await client._async_sessions.async_close()
+
+    # Verify we can get a new session after closing
+    new_session = client._async_sessions.get()
+    assert new_session is not None
+    assert id(new_session) != id(async_session), "Should create new session after close"
+
+    # Clean up
+    await client._async_sessions.async_close()

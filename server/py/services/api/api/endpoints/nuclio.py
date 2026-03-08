@@ -15,9 +15,7 @@
 import asyncio
 import http
 import traceback
-import typing
 from http import HTTPStatus
-from typing import Optional
 
 import fastapi
 import semver
@@ -27,6 +25,7 @@ from fastapi.concurrency import run_in_threadpool
 
 import mlrun.common.schemas
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
+from mlrun.common.runtimes.validators import validate_sidecar_probes
 from mlrun.common.schemas.serving import DeployResponse
 from mlrun.config import config
 from mlrun.utils import logger
@@ -232,10 +231,10 @@ async def deploy_function(
     background_tasks: fastapi.BackgroundTasks,
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
     db_session: sqlalchemy.orm.Session = Depends(deps.get_db_session),
-    client_version: typing.Optional[str] = Header(
+    client_version: str | None = Header(
         None, alias=mlrun.common.schemas.HeaderNames.client_version
     ),
-    client_python_version: typing.Optional[str] = Header(
+    client_python_version: str | None = Header(
         None, alias=mlrun.common.schemas.HeaderNames.python_version
     ),
 ):
@@ -331,7 +330,7 @@ async def deploy_status(
     if fn.get("kind") not in mlrun.runtimes.RuntimeKinds.nuclio_runtimes():
         framework.api.utils.log_and_raise(
             HTTPStatus.BAD_REQUEST.value,
-            reason=f"Runtime kind {fn.kind} is not a nuclio runtime",
+            reason=f"Runtime kind `{fn.get('kind')}` is not a nuclio runtime",
         )
     api_gateways_urls = await _get_api_gateways_urls_for_function(
         auth_info, project, name, tag
@@ -430,7 +429,7 @@ def _deploy_function(
     builder_env: dict,
     client_version: str,
     client_python_version: str,
-    model_endpoint_creation_task_name: Optional[str] = None,
+    model_endpoint_creation_task_name: str | None = None,
 ):
     fn = None
     try:
@@ -476,11 +475,27 @@ def _deploy_function(
         # which later in Nuclio will be masked and saved to secrets
         raw_config = fn.mask_sensitive_data_in_config()
 
+        # Add auth token name in function spec
+        # TODO in ML-11600/ML-11599 need to handle redeployment with different auth token name
+        launcher.enrich_and_validate_auth_token_name(fn)
+
+        # Validate sidecar probe configurations before deployment
+        sidecars = fn.spec.config.get("spec.sidecars") or []
+        if sidecars:
+            try:
+                validate_sidecar_probes(sidecars)
+            except mlrun.errors.MLRunInvalidArgumentError as exc:
+                framework.api.utils.log_and_raise(
+                    HTTPStatus.BAD_REQUEST.value,
+                    reason=str(exc),
+                )
+
         # save the function to DB
         fn.save(versioned=False)
 
         # after saving function to DB, we need to restore the original config so that the sensitive data won't be stored
         fn.spec.config = raw_config
+
         fn = _deploy_nuclio_runtime(
             auth_info,
             builder_env,
@@ -514,7 +529,7 @@ def _deploy_nuclio_runtime(
     )
 
     if monitoring_application or serving_to_monitor:
-        if not mlrun.mlconf.is_ce_mode():
+        if mlrun.mlconf.is_using_v3io():
             model_monitoring_access_key = process_model_monitoring_secret(
                 db_session,
                 fn.metadata.project,
@@ -712,7 +727,7 @@ def _is_nuclio_deploy_status_changed(
     previous_status: dict,
     new_status: dict,
     new_state: str,
-    new_nuclio_name: typing.Optional[str] = None,
+    new_nuclio_name: str | None = None,
 ) -> bool:
     # get relevant fields from the new status
     new_container_image = new_status.get("containerImage", "")

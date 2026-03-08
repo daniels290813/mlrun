@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import pathlib
-import typing
 import unittest.mock
 from collections.abc import Generator, Iterator
 from datetime import datetime
@@ -36,7 +35,8 @@ import mlrun.utils.singleton
 import mlrun_pipelines.client
 import mlrun_pipelines.utils
 
-import framework.utils.clients.iguazio
+import framework.utils.clients.iguazio.v3
+import framework.utils.clients.iguazio.v4
 import framework.utils.projects.remotes.leader
 import framework.utils.singletons.k8s
 import services.api.crud
@@ -184,16 +184,41 @@ def api_url() -> str:
 @pytest.fixture()
 def iguazio_client(
     request: pytest.FixtureRequest,
-) -> framework.utils.clients.iguazio.Client:
-    if request.param == "async":
-        client = framework.utils.clients.iguazio.AsyncClient()
-    else:
-        client = framework.utils.clients.iguazio.Client()
+):
+    """
+    A parameterized fixture to return either an IG3 or IG4 client (sync or async)
+    based on request parameters.
 
-    # force running init again so the configured api url will be used
-    client.__init__()
+    Usage:
+        @pytest.mark.parametrize(
+            "iguazio_client",
+            [("v3", "async"), ("v4", "sync")],
+            indirect=True
+        )
+    """
+    version, mode = request.param
+
+    if version == "v3":
+        module = framework.utils.clients.iguazio.v3
+        client_cls = module.Client if mode == "sync" else module.AsyncClient
+        client = client_cls()
+    elif version == "v4":
+        module = framework.utils.clients.iguazio.v4
+        client_cls = module.Client if mode == "sync" else module.AsyncClient
+
+        # PATCH iguazio.Client before instantiation
+        with unittest.mock.patch(
+            "framework.utils.clients.iguazio.v4.iguazio.Client"
+        ) as mock_iguazio_cls:
+            mock_instance = unittest.mock.MagicMock()
+            mock_iguazio_cls.return_value = mock_instance
+
+            # Now when Client.__init__ runs, self._client is assigned to mock_instance
+            client = client_cls()
+    else:
+        raise ValueError(f"Unsupported client version: {version}")
+
     client._wait_for_job_completion_retry_interval = 0
-    client._wait_for_project_terminal_state_retry_interval = 0
 
     # inject the request param into client, so we can use it in tests
     setattr(client, "mode", request.param)
@@ -301,6 +326,7 @@ class MockedProjectFollowerIguazioClient(
         self,
         session: str,
         project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
         wait_for_completion: bool = True,
     ) -> bool:
         services.api.crud.Projects().create_project(self._db_session, project)
@@ -311,6 +337,7 @@ class MockedProjectFollowerIguazioClient(
         session: str,
         name: str,
         project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ):
         pass
 
@@ -318,6 +345,7 @@ class MockedProjectFollowerIguazioClient(
         self,
         session: str,
         name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
         deletion_strategy: mlrun.common.schemas.DeletionStrategy = mlrun.common.schemas.DeletionStrategy.default(),
         wait_for_completion: bool = True,
     ) -> bool:
@@ -340,14 +368,16 @@ class MockedProjectFollowerIguazioClient(
     def list_projects(
         self,
         session: str,
-        updated_after: typing.Optional[datetime] = None,
-    ) -> tuple[list[mlrun.common.schemas.Project], typing.Optional[datetime]]:
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
+        updated_after: datetime | None = None,
+    ) -> tuple[list[mlrun.common.schemas.Project], datetime | None]:
         return [], None
 
     def get_project(
         self,
         session: str,
         name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ) -> mlrun.common.schemas.Project:
         pass
 
@@ -360,6 +390,7 @@ class MockedProjectFollowerIguazioClient(
         self,
         session: str,
         name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ) -> mlrun.common.schemas.ProjectOwner:
         pass
 
@@ -373,8 +404,8 @@ def mock_project_follower_iguazio_client(
     """
     mlrun.mlconf.httpdb.projects.leader = "iguazio"
     mlrun.mlconf.httpdb.projects.iguazio_access_key = "access_key"
-    old_iguazio_client = framework.utils.clients.iguazio.Client
-    framework.utils.clients.iguazio.Client = MockedProjectFollowerIguazioClient
+    old_iguazio_client = framework.utils.clients.iguazio.v3.Client
+    framework.utils.clients.iguazio.v3.Client = MockedProjectFollowerIguazioClient
     framework.utils.singletons.project_member.initialize_project_member()
     iguazio_client = MockedProjectFollowerIguazioClient()
     iguazio_client._db_session = db
@@ -382,4 +413,4 @@ def mock_project_follower_iguazio_client(
 
     yield iguazio_client
 
-    framework.utils.clients.iguazio.Client = old_iguazio_client
+    framework.utils.clients.iguazio.v3.Client = old_iguazio_client

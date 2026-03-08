@@ -18,12 +18,15 @@ import asyncio
 import base64
 import copy
 import importlib
+import inspect
 import json
 import os
 import socket
 import traceback
 import uuid
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import UTC, datetime
+from http import HTTPMethod
 from typing import Any, Optional, Union
 
 import pandas as pd
@@ -36,7 +39,9 @@ import mlrun.common.helpers
 import mlrun.common.schemas
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
 import mlrun.datastore.datastore_profile as ds_profile
+import mlrun.errors
 import mlrun.model_monitoring
+import mlrun.runtimes.nuclio.serving
 import mlrun.utils
 from mlrun.config import config
 from mlrun.errors import err_to_str
@@ -50,7 +55,7 @@ from ..datastore.store_resources import ResourceCache
 from ..errors import MLRunInvalidArgumentError
 from ..execution import MLClientCtx
 from ..model import ModelObj
-from ..utils import get_caller_globals, get_module_name_from_path
+from ..utils import get_caller_globals, get_relative_module_name_from_path
 from .states import (
     FlowStep,
     MonitoredStep,
@@ -126,6 +131,7 @@ class GraphServer(ModelObj):
         function_tag=None,
         project=None,
         model_endpoint_creation_task_name=None,
+        api_handler_config: "mlrun.runtimes.nuclio.serving.APIHandlerConfig | None" = None,
     ):
         self._graph = None
         self.graph: Union[RouterStep, RootFlowStep] = graph
@@ -151,6 +157,8 @@ class GraphServer(ModelObj):
         self.function_tag = function_tag
         self.project = project
         self.model_endpoint_creation_task_name = model_endpoint_creation_task_name
+        self.streaming = False
+        self.api_handler_config = api_handler_config
 
     def set_current_function(self, function):
         """set which child function this server is currently running on"""
@@ -179,11 +187,11 @@ class GraphServer(ModelObj):
         self,
         context,
         namespace,
-        resource_cache: Optional[ResourceCache] = None,
+        resource_cache: ResourceCache | None = None,
         logger=None,
         is_mock=False,
         monitoring_mock=False,
-        stream_profile: Optional[ds_profile.DatastoreProfile] = None,
+        stream_profile: ds_profile.DatastoreProfile | None = None,
     ) -> None:
         """for internal use, initialize all steps (recursively)"""
 
@@ -239,13 +247,13 @@ class GraphServer(ModelObj):
     def test(
         self,
         path: str = "/",
-        body: Optional[Union[str, bytes, dict]] = None,
+        body: Union[str, bytes, dict] | None = None,
         method: str = "",
-        headers: Optional[str] = None,
-        content_type: Optional[str] = None,
+        headers: str | None = None,
+        content_type: str | None = None,
         silent: bool = False,
         get_body: bool = True,
-        event_id: Optional[str] = None,
+        event_id: str | None = None,
         trigger: "MockTrigger" = None,
         offset=None,
         time=None,
@@ -275,7 +283,7 @@ class GraphServer(ModelObj):
                 "no models or steps were set, use function.set_topology() and add steps"
             )
         if not method:
-            method = "POST" if body else "GET"
+            method = HTTPMethod.POST if body else HTTPMethod.GET
         event = MockEvent(
             body=body,
             path=path,
@@ -292,17 +300,18 @@ class GraphServer(ModelObj):
             raise RuntimeError(f"failed ({resp.status_code}): {resp.body}")
         return resp
 
-    def run(self, event, context=None, get_body=False, extra_args=None):
+    def run(self, event, context=None, get_body: bool = False, extra_args=None):
         server_context = self.context
         context = context or server_context
         event.content_type = event.content_type or self.default_content_type or ""
+
         if event.headers:
             if event_id_key in event.headers:
                 event.id = event.headers.get(event_id_key)
             if event_path_key in event.headers:
                 event.path = event.headers.get(event_path_key)
 
-        if isinstance(event.body, (str, bytes)) and (
+        if isinstance(event.body, str | bytes) and (
             not event.content_type or event.content_type in ["json", "application/json"]
         ):
             # assume it is json and try to load
@@ -321,38 +330,27 @@ class GraphServer(ModelObj):
         try:
             response = self.graph.run(event, **(extra_args or {}))
         except Exception as exc:
+            # Extract appropriate status code from MLRunHTTPStatusError exceptions
+            # For backwards compatibility, default to 400 for other exceptions
+            if isinstance(exc, mlrun.errors.MLRunHTTPStatusError):
+                status_code = exc.error_status_code
+            else:
+                status_code = 400
+
             message = f"{exc.__class__.__name__}: {err_to_str(exc)}"
             if server_context.verbose:
                 message += "\n" + str(traceback.format_exc())
             context.logger.error(f"run error, {traceback.format_exc()}")
             server_context.push_error(event, message, source="_handler")
             return context.Response(
-                body=message, content_type="text/plain", status_code=400
+                body=message, content_type="text/plain", status_code=status_code
             )
 
-        if asyncio.iscoroutine(response):
-            return self._process_async_response(context, response, get_body)
-        else:
-            return self._process_response(context, response, get_body)
+        # TODO: this is only relevant in certain flows (MockServer, sync...)
+        if hasattr(response, "body"):
+            response = response.body
 
-    async def _process_async_response(self, context, response, get_body):
-        return self._process_response(context, await response, get_body)
-
-    def _process_response(self, context, response, get_body):
-        body = response.body
-        if (
-            isinstance(context, MLClientCtx)
-            or isinstance(body, context.Response)
-            or get_body
-        ):
-            return body
-
-        if body and not isinstance(body, (str, bytes)):
-            body = json.dumps(body)
-            return context.Response(
-                body=body, content_type="application/json", status_code=200
-            )
-        return body
+        return response
 
     def wait_for_completion(self):
         """wait for async operation to complete"""
@@ -362,13 +360,23 @@ class GraphServer(ModelObj):
 def add_error_raiser_step(
     graph: RootFlowStep, monitored_steps: dict[str, MonitoredStep]
 ) -> RootFlowStep:
-    monitored_steps_raisers = {}
-    user_steps = list(graph.steps.values())
     for monitored_step in monitored_steps.values():
+        unpack_step = f"{monitored_step.name}_unpacker"
+        graph.add_step(
+            class_name="storey.FlatMap",
+            name=unpack_step,
+            _fn="(event.body)",
+            after=monitored_step.name,
+            full_event=True,
+            model_endpoint_creation_strategy=mlrun.common.schemas.ModelEndpointCreationStrategy.SKIP,
+            function=monitored_step.function,
+        )
+
+        # Add error raiser step after the unpacker
         error_step = graph.add_step(
             class_name="mlrun.serving.states.ModelRunnerErrorRaiser",
             name=f"{monitored_step.name}_error_raise",
-            after=monitored_step.name,
+            after=[monitored_step.name, unpack_step],
             full_event=True,
             raise_exception=monitored_step.raise_exception,
             models_names=list(monitored_step.class_args["models"].keys()),
@@ -378,21 +386,7 @@ def add_error_raiser_step(
         if monitored_step.responder:
             monitored_step.responder = False
             error_step.respond()
-        monitored_steps_raisers[monitored_step.name] = error_step.name
         error_step.on_error = monitored_step.on_error
-    if monitored_steps_raisers:
-        for step in user_steps:
-            if step.after:
-                if isinstance(step.after, list):
-                    for i in range(len(step.after)):
-                        if step.after[i] in monitored_steps_raisers:
-                            step.after[i] = monitored_steps_raisers[step.after[i]]
-                else:
-                    if (
-                        isinstance(step.after, str)
-                        and step.after in monitored_steps_raisers
-                    ):
-                        step.after = monitored_steps_raisers[step.after]
     return graph
 
 
@@ -488,14 +482,86 @@ def add_monitoring_general_steps(
     return graph, monitor_flow_step
 
 
+def _add_api_handler_step_to_graph(
+    graph: RootFlowStep,
+    serving_spec: Optional["mlrun.runtimes.nuclio.serving.ServingSpec"],
+    context: "GraphContext",
+) -> RootFlowStep:
+    """Add API handler step to graph if api_handler_config is present"""
+    if isinstance(serving_spec, dict):
+        # Nuclio runtime
+        api_handler_config = serving_spec.get("api_handler_config")
+    elif isinstance(serving_spec, mlrun.runtimes.nuclio.serving.ServingSpec):
+        # Mock server
+        api_handler_config = getattr(serving_spec, "api_handler_config", None)
+    else:
+        raise mlrun.errors.MLRunValueError(
+            f"serving_spec must be dict or ServingSpec, got {type(serving_spec)}"
+        )
+    if api_handler_config:
+        context.logger.info(
+            "Adding API handler step to graph based on serving spec config"
+        )
+        # Check if _APIHandlerStep already exists to avoid duplicates
+        existing_api_handler = None
+        for step_name, step in graph.steps.items():
+            if (
+                hasattr(step, "class_name")
+                and step.class_name == "mlrun.serving.api_handler._APIHandlerStep"
+            ):
+                existing_api_handler = step
+                break
+
+        if not existing_api_handler:
+            # Find current starting steps (using same logic as check_and_process_graph)
+            current_start_steps = []
+            for step_name, step in graph.steps.items():
+                # A step is a starting step if:
+                # 1. It has no 'after' and no 'cycle_from' (simple starting step)
+                # 2. It has both 'after' and 'cycle_from', and they match (cyclic starting step)
+                if not step.after and not getattr(step, "cycle_from", None):
+                    current_start_steps.append(step_name)
+                elif (
+                    step.after
+                    and getattr(step, "cycle_from", None)
+                    and set(step.after) == set(step.cycle_from)
+                ):
+                    current_start_steps.append(step_name)
+
+            # Add _APIHandlerStep as the first step
+            graph.add_step(
+                class_name="mlrun.serving.api_handler._APIHandlerStep",
+                name="api-handler",
+                graph_shape="diamond",
+                config=api_handler_config,
+                context=context,
+                after=None,  # First step
+                full_event=True,
+            )
+
+            # Chain all existing starting steps to come after the API handler step
+            for step_name in current_start_steps:
+                step = graph[step_name]
+                step.after = step.after or []
+                if isinstance(step.after, str):
+                    step.after = [step.after]
+                if "api-handler" not in step.after:
+                    step.after.append("api-handler")
+
+    return graph
+
+
 def add_system_steps_to_graph(
     project: str,
     graph: RootFlowStep,
     track_models: bool,
     context,
-    serving_spec,
+    serving_spec: Optional["mlrun.runtimes.nuclio.serving.ServingSpec"],
     pause_until_background_task_completion: bool = True,
 ) -> RootFlowStep:
+    # Always add API handler step if configured
+    graph = _add_api_handler_step_to_graph(graph, serving_spec, context)
+
     if not (isinstance(graph, RootFlowStep) and graph.include_monitored_step()):
         return graph
     monitored_steps = graph.get_monitored_steps()
@@ -511,21 +577,39 @@ def add_system_steps_to_graph(
         )
         if background_task_status_step:
             monitor_flow_step = background_task_status_step
-        # Connect each model runner to the monitoring step:
+
+        # Check if streaming is enabled for this function
+        streaming_enabled = (
+            serving_spec.get("streaming", False)
+            if isinstance(serving_spec, dict)
+            else getattr(serving_spec, "streaming", False)
+        )
+
+        # Connect each model runner to the monitoring step.
+        # For streaming functions, add a Collector step to aggregate streaming
+        # chunks into a single event for MM. For non-streaming, connect directly.
         for step_name, step in monitored_steps.items():
+            if streaming_enabled:
+                # Add a Collector step after each monitored step
+                collector_name = f"{step_name}_collector"
+                graph.add_step(
+                    "storey.Collector",
+                    collector_name,
+                    after=step_name,
+                    model_endpoint_creation_strategy=mlrun.common.schemas.ModelEndpointCreationStrategy.SKIP,
+                )
+                source_step = collector_name
+            else:
+                source_step = step_name
+
+            # Connect monitor_flow_step to receive from source
             if monitor_flow_step.after:
                 if isinstance(monitor_flow_step.after, list):
-                    monitor_flow_step.after.append(step_name)
+                    monitor_flow_step.after.append(source_step)
                 elif isinstance(monitor_flow_step.after, str):
-                    monitor_flow_step.after = [monitor_flow_step.after, step_name]
+                    monitor_flow_step.after = [monitor_flow_step.after, source_step]
             else:
-                monitor_flow_step.after = [
-                    step_name,
-                ]
-    context.logger.info_with(
-        "Server graph after adding system steps",
-        graph=str(graph.steps),
-    )
+                monitor_flow_step.after = [source_step]
     return graph
 
 
@@ -552,6 +636,8 @@ def v2_serving_init(context, namespace=None):
         current_function=os.getenv("SERVING_CURRENT_FUNCTION", ""),
     )
     server.set_current_function(os.getenv("SERVING_CURRENT_FUNCTION", ""))
+    # Set streaming mode before init_states so it's available during graph initialization
+    server.streaming = spec.get("streaming", False)
     context.logger.info_with(
         "Initializing states", namespace=namespace or get_caller_globals()
     )
@@ -565,8 +651,23 @@ def v2_serving_init(context, namespace=None):
     )
     context.logger.info("Initializing graph steps")
     server.init_object(namespace or get_caller_globals())
-    # set the handler hook to point to our handler
-    setattr(context, "mlrun_handler", v2_serving_handler)
+
+    # Select the appropriate handler based on streaming mode
+    if server.streaming:
+        # Validate that trigger is HTTP when streaming is enabled
+        if (
+            hasattr(context, "trigger")
+            and getattr(context.trigger, "kind", "http") != "http"
+        ):
+            raise ValueError(
+                f"Streaming is only supported with HTTP triggers, but trigger kind is "
+                f"'{context.trigger.kind}'. Disable streaming or use an HTTP trigger."
+            )
+        context.logger.info("Streaming mode enabled, using streaming handler")
+        setattr(context, "mlrun_handler", v2_serving_streaming_handler)
+    else:
+        setattr(context, "mlrun_handler", v2_serving_handler)
+
     setattr(context, "_server", server)
     context.logger.info_with("Serving was initialized", verbose=server.verbose)
     if server.verbose:
@@ -578,12 +679,22 @@ def v2_serving_init(context, namespace=None):
 async def async_execute_graph(
     context: MLClientCtx,
     data: DataItem,
-    timestamp_column: Optional[str],
+    timestamp_column: str | None,
     batching: bool,
-    batch_size: Optional[int],
+    batch_size: int | None,
     read_as_lists: bool,
     nest_under_inputs: bool,
-) -> list[Any]:
+) -> None:
+    # Validate that data parameter is a DataItem and not passed via params
+    if not isinstance(data, DataItem):
+        raise MLRunInvalidArgumentError(
+            f"Parameter 'data' has type hint 'DataItem' but got {type(data).__name__} instead. "
+            f"Data files and artifacts must be passed via the 'inputs' parameter, not 'params'. "
+            f"The 'params' parameter is for simple configuration values (strings, numbers, booleans), "
+            f"while 'inputs' is for data files that need to be loaded. "
+            f"Example: run_function(..., inputs={{'data': 'path/to/data.csv'}}, params={{other_config: value}})"
+        )
+    run_call_count = 0
     spec = mlrun.utils.get_serving_spec()
     modname = None
     code = os.getenv("MLRUN_EXEC_CODE")
@@ -597,7 +708,17 @@ async def async_execute_graph(
         #  gets set in local flow and not just in the remote pod
         source_file_path = spec.get("filename", None)
         if source_file_path:
-            modname = get_module_name_from_path(source_file_path)
+            source_file_path_object, working_dir_path_object = (
+                mlrun.utils.helpers.get_source_and_working_dir_paths(source_file_path)
+            )
+            if not source_file_path_object.is_relative_to(working_dir_path_object):
+                raise mlrun.errors.MLRunRuntimeError(
+                    f"Source file path '{source_file_path}' is not under the current working directory "
+                    f"(which is required when running with local=True)"
+                )
+            modname = get_relative_module_name_from_path(
+                source_file_path_object, working_dir_path_object
+            )
 
     namespace = {}
     if modname:
@@ -632,7 +753,7 @@ async def async_execute_graph(
 
     if df.empty:
         context.logger.warn("Job terminated due to empty inputs (0 rows)")
-        return []
+        return
 
     track_models = spec.get("track_models")
 
@@ -659,7 +780,7 @@ async def async_execute_graph(
             start_time = end_time = df["timestamp"].iloc[0].isoformat()
     else:
         # end time will be set from clock time when the batch completes
-        start_time = datetime.now(tz=timezone.utc).isoformat()
+        start_time = datetime.now(tz=UTC).isoformat()
 
     server.graph = add_system_steps_to_graph(
         server.project,
@@ -672,7 +793,6 @@ async def async_execute_graph(
 
     if config.log_level.lower() == "debug":
         server.verbose = True
-    context.logger.info_with("Initializing states", namespace=namespace)
     kwargs = {}
     if hasattr(context, "is_mock"):
         kwargs["is_mock"] = context.is_mock
@@ -690,6 +810,7 @@ async def async_execute_graph(
         context.logger.info(server.to_yaml())
 
     async def run(body):
+        nonlocal run_call_count
         event = storey.Event(id=index, body=body)
         if timestamp_column:
             if batching:
@@ -704,6 +825,7 @@ async def async_execute_graph(
                     f"Event body '{body}' did not contain timestamp column '{timestamp_column}'"
                 )
             event._original_timestamp = body[timestamp_column]
+        run_call_count += 1
         return await server.run(event, context)
 
     if batching and not batch_size:
@@ -738,7 +860,7 @@ async def async_execute_graph(
     server = GraphServer.from_dict(spec)
     server.init_states(None, namespace)
 
-    batch_completion_time = datetime.now(tz=timezone.utc).isoformat()
+    batch_completion_time = datetime.now(tz=UTC).isoformat()
 
     if not timestamp_column:
         end_time = batch_completion_time
@@ -761,7 +883,50 @@ async def async_execute_graph(
         model_endpoint_uids=model_endpoint_uids,
     )
 
-    return responses
+    has_responder = False
+    for step in server.graph.steps.values():
+        if getattr(step, "responder", False):
+            has_responder = True
+            break
+
+    if has_responder:
+        # log the results as a dataset artifact
+        artifact_path = None
+        if (
+            "{{run.uid}}" not in context.artifact_path
+        ):  # TODO: delete when IG-22841 is resolved
+            artifact_path = "+/{{run.uid}}"  # will be concatenated to the context's path in extend_artifact_path
+        context.log_dataset(
+            "prediction", df=pd.DataFrame(responses), artifact_path=artifact_path
+        )
+
+        # if we got responses that appear to be in the right format, try to log per-model datasets too
+        if (
+            responses
+            and responses[0]
+            and isinstance(responses[0], dict)
+            and isinstance(next(iter(responses[0].values())), dict | list)
+        ):
+            try:
+                # turn this list of samples into a dict of lists, one per model endpoint
+                grouped = defaultdict(list)
+                for sample in responses:
+                    for model_name, features in sample.items():
+                        grouped[model_name].append(features)
+                # create a dataframe per model endpoint and log it
+                for model_name, features in grouped.items():
+                    context.log_dataset(
+                        f"prediction_{model_name}",
+                        df=pd.DataFrame(features),
+                        artifact_path=artifact_path,
+                    )
+            except Exception as e:
+                context.logger.warning(
+                    "Failed to log per-model prediction datasets",
+                    error=err_to_str(e),
+                )
+
+    context.log_result("num_rows", run_call_count)
 
 
 def _is_inside_asyncio_loop():
@@ -787,12 +952,12 @@ def _workaround_asyncio_nesting():
 def execute_graph(
     context: MLClientCtx,
     data: DataItem,
-    timestamp_column: Optional[str] = None,
+    timestamp_column: str | None = None,
     batching: bool = False,
-    batch_size: Optional[int] = None,
+    batch_size: int | None = None,
     read_as_lists: bool = False,
     nest_under_inputs: bool = False,
-) -> (list[Any], Any):
+) -> tuple[list[Any], Any]:
     """
     Execute graph as a job, from start to finish.
 
@@ -807,7 +972,7 @@ def execute_graph(
     :param read_as_lists: Whether to read each row as a list instead of a dictionary.
     :param nest_under_inputs: Whether to wrap each row with {"inputs": ...}.
 
-    :return: A list of responses.
+    :return: A tuple containing a list of responses and any additional data.
     """
     if _is_inside_asyncio_loop():
         _workaround_asyncio_nesting()
@@ -863,8 +1028,11 @@ def _set_callbacks(server, context):
         context.platform.set_drain_callback(drain_callback)
 
 
-def v2_serving_handler(context, event, get_body=False):
-    """hook for nuclio handler()"""
+def _preprocess_event(context, event):
+    """Preprocess event before running through the graph.
+
+    Handles Nuclio workarounds for empty body and stream path setup.
+    """
     if context._server.http_trigger:
         # Workaround for a Nuclio bug where it sometimes passes b'' instead of None due to dirty memory
         if event.body == b"":
@@ -885,7 +1053,63 @@ def v2_serving_handler(context, event, get_body=False):
     ):
         event.path = "/"
 
-    return context._server.run(event, context, get_body)
+
+def _process_single_response(context, response, get_body):
+    if (
+        isinstance(context, MLClientCtx)
+        or isinstance(response, context.Response)
+        or get_body
+    ):
+        return response
+
+    if response and not isinstance(response, str | bytes):
+        body = json.dumps(response)
+        return context.Response(
+            body=body, content_type="application/json", status_code=200
+        )
+    return response
+
+
+async def _process_single_async_response(context, response, get_body):
+    return _process_single_response(context, await response, get_body)
+
+
+def v2_serving_handler(context, event, get_body=False):
+    """Standard handler for non-streaming serving functions."""
+    _preprocess_event(context, event)
+    response = context._server.run(event, context, get_body)
+    if asyncio.iscoroutine(response):
+        return _process_single_async_response(context, response, get_body)
+
+    return _process_single_response(context, response, get_body)
+
+
+async def v2_serving_streaming_handler(context, event, get_body=False):
+    """Async streaming handler for nuclio that yields results as they arrive.
+
+    This handler is used when streaming mode is enabled on the serving function.
+    It yields results from streaming steps in the graph as they are produced,
+    allowing for real-time streaming responses (e.g., for LLM token streaming).
+
+    The handler is an async generator function that nuclio recognizes and handles
+    appropriately, streaming responses back to the HTTP client.
+    """
+    _preprocess_event(context, event)
+    response = context._server.run(event, context, get_body)
+
+    # Unwrap coroutines to get the actual result
+    if asyncio.iscoroutine(response):
+        response = await response
+
+    # Yield chunks from the response
+    if inspect.isasyncgen(response):
+        async for chunk in response:
+            yield chunk
+    elif inspect.isgenerator(response):
+        for chunk in response:
+            yield chunk
+    else:
+        yield response
 
 
 def create_graph_server(
@@ -902,7 +1126,9 @@ def create_graph_server(
 
         server = create_graph_server(graph=RouterStep(), parameters={})
         server.init(None, globals())
-        server.graph.add_route("my", class_name=MyModelClass, model_path="{path}", z=100)
+        server.graph.add_route(
+            "my", class_name=MyModelClass, model_path="{path}", z=100
+        )
         print(server.test("/v2/models/my/infer", testdata))
     """
     parameters = parameters or {}
@@ -977,7 +1203,7 @@ class GraphContext:
         level="info",  # Unused argument
         logger=None,
         server=None,
-        nuclio_context: Optional[NuclioContext] = None,
+        nuclio_context: NuclioContext | None = None,
     ) -> None:
         self.state = None
         self.logger = logger
@@ -986,7 +1212,7 @@ class GraphContext:
         self.verbose = False
         self.stream = None
         self.root = None
-        self.executor: Optional[storey.flow.RunnableExecutor] = None
+        self.executor: storey.flow.RunnableExecutor | None = None
 
         if nuclio_context:
             self.logger: NuclioLogger = nuclio_context.logger

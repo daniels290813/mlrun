@@ -15,7 +15,7 @@
 import re
 from contextlib import AbstractContextManager
 from contextlib import nullcontext as does_not_raise
-from typing import Any, Optional
+from typing import Any
 
 import pydantic.v1
 import pytest
@@ -64,7 +64,7 @@ from mlrun.model_monitoring.db.tsdb.v3io.stream_graph_steps import (
 )
 def test_fqn_parsing(
     fqn: str,
-    expected_result: Optional[ModelEndpointMonitoringMetricType],
+    expected_result: ModelEndpointMonitoringMetricType | None,
     expectation: AbstractContextManager,
 ) -> None:
     with expectation:
@@ -142,22 +142,22 @@ def test_project_pattern() -> None:
         # nested dict flattening
         (
             {"outer": {"inner-key": 99}},
-            {"outer.inner_key": 99},
+            {"outer:inner_key": 99},
         ),
         # multiple nested levels
         (
             {"a": {"b": {"c-key": 5}}},
-            {"a.b.c_key": 5},
+            {"a:b:c_key": 5},
         ),
         # mixed dicts and values
         (
             {"root": {"sub1": 1, "sub-2": {"deep-key": "x"}}, "plain": 7},
-            {"root.sub1": 1, "root.sub_2.deep_key": "x", "plain": 7},
+            {"root:sub1": 1, "root:sub_2:deep_key": "x", "plain": 7},
         ),
         # key with digit prefix deep inside
         (
             {"root": {"123abc": {"-bad-key": 1}}},
-            {"root._123abc._bad_key": 1},
+            {"root:_123abc:_bad_key": 1},
         ),
     ],
 )

@@ -877,12 +877,12 @@ def test_set_function_update_code():
             tag="v1",
         )
 
-        assert id(func) == id(
-            project.get_function("handler")
-        ), f"Function of index {i} was not set correctly"
-        assert id(func) == id(
-            project.get_function("handler:v1")
-        ), f"Function of index {i} was not set and tagged correctly"
+        assert id(func) == id(project.get_function("handler")), (
+            f"Function of index {i} was not set correctly"
+        )
+        assert id(func) == id(project.get_function("handler:v1")), (
+            f"Function of index {i} was not set and tagged correctly"
+        )
 
 
 def test_set_function_with_conflicting_tag():
@@ -1979,6 +1979,7 @@ def test_load_project_from_yaml_with_function(context):
         mlrun.common.schemas.APIGatewayAuthenticationMode.none,
         mlrun.common.schemas.APIGatewayAuthenticationMode.basic,
         mlrun.common.schemas.APIGatewayAuthenticationMode.access_key,
+        mlrun.common.schemas.APIGatewayAuthenticationMode.iguazio,
     ],
 )
 @unittest.mock.patch.object(mlrun.db.nopdb.NopDB, "store_api_gateway")
@@ -2048,6 +2049,10 @@ def test_create_api_gateway_valid(
         == mlrun.common.schemas.APIGatewayAuthenticationMode.access_key
     ):
         api_gateway.with_access_key_auth()
+    elif (
+        authentication_mode == mlrun.common.schemas.APIGatewayAuthenticationMode.iguazio
+    ):
+        api_gateway.with_iguazio_auth()
 
     gateway = project.store_api_gateway(api_gateway=api_gateway)
 
@@ -2063,6 +2068,10 @@ def test_create_api_gateway_valid(
         == mlrun.common.schemas.APIGatewayAuthenticationMode.access_key
     ):
         assert gateway.authentication.authentication_mode == "accessKey"
+    elif (
+        authentication_mode == mlrun.common.schemas.APIGatewayAuthenticationMode.iguazio
+    ):
+        assert gateway.authentication.authentication_mode == "iguazio"
     else:
         assert gateway.authentication.authentication_mode == "none"
 
@@ -2592,3 +2601,153 @@ class TestModelMonitoring:
             mlrun.projects.MlrunProject().create_model_monitoring_function(
                 name="my-invalid-app-name-batch", application_class="NoApp"
             )
+
+
+def _auth_prefix() -> str:
+    # Matches how the code builds the pattern: format(hashed_access_key="")
+    return mlrun.mlconf.secret_stores.kubernetes.auth_secret_name.format(
+        hashed_access_key=""
+    )
+
+
+class _StubAzureVaultStore:
+    """No-op stub to avoid real Azure config and network."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def get_secrets(self, secrets):
+        # Return empty dict; we only care that client-side validation didn't block.
+        return {}
+
+
+def test_with_secrets_azure_vault_blocks_auth_secret_name(tmp_path, monkeypatch):
+    # Ensure we never touch the real Azure implementation
+    monkeypatch.setattr(mlrun.secrets, "AzureVaultStore", _StubAzureVaultStore)
+
+    project = mlrun.new_project("proj-auth-block", context=str(tmp_path), save=False)
+
+    forbidden = _auth_prefix() + "anything"
+    with pytest.raises(mlrun.errors.MLRunInvalidArgumentError) as exc:
+        project.with_secrets(
+            "azure_vault",
+            {
+                "name": "vault1",
+                "k8s_secret": forbidden,
+                "tenant_id": "t",
+                "vault_url": "https://x",
+                "secrets": [],  # required by secrets store path
+            },
+        )
+    assert "Forbidden secret" in str(exc.value)
+    assert forbidden in str(exc.value)
+
+
+def test_with_secrets_azure_vault_allows_non_auth_secret(tmp_path, monkeypatch):
+    # Stub Azure so we don't require tenant/client_id config
+    monkeypatch.setattr(mlrun.secrets, "AzureVaultStore", _StubAzureVaultStore)
+
+    project = mlrun.new_project("proj-auth-allow", context=str(tmp_path), save=False)
+
+    allowed = "my-regular-k8s-secret"
+    # Should not raise
+    project.with_secrets(
+        "azure_vault",
+        {
+            "name": "vault1",
+            "k8s_secret": allowed,
+            "tenant_id": "t",
+            "vault_url": "https://x",
+            "secrets": [],  # minimal valid payload for add_source
+        },
+    )
+
+
+def test_project_enrich():
+    base = mlrun.projects.project.MlrunProject(
+        metadata=mlrun.projects.project.ProjectMetadata(
+            name="p1",
+        ),
+        spec=mlrun.projects.project.ProjectSpec(
+            source="repo1",
+            params={"a": "1", "b": "2"},
+        ),
+    )
+    base.status = mlrun.projects.project.ProjectStatus(state="offline")
+    base.spec.context = "/somewhere"
+
+    other = mlrun.projects.project.MlrunProject(
+        metadata=mlrun.projects.project.ProjectMetadata(
+            name="p1",
+            labels={"b": "3"},
+            annotations={"y": "2"},
+        ),
+        spec=mlrun.projects.project.ProjectSpec(
+            source="repo1",
+            owner="bob",
+        ),
+    )
+    other.status = mlrun.projects.project.ProjectStatus(state="online")
+
+    base_metadata_id = id(base.metadata)
+    base_spec_id = id(base.spec)
+    base_status_id = id(base.status)
+
+    base._enrich(other)
+
+    # string overwrite
+    assert base.kind == "project"
+
+    # objects are mutated in-place (not replaced)
+    assert id(base.metadata) == base_metadata_id
+    assert id(base.spec) == base_spec_id
+    assert id(base.status) == base_status_id
+
+    # shallow merge semantics: dict-valued fields are replaced (not deep-merged)
+    assert base.metadata.labels == {"b": "3"}
+    assert base.metadata.annotations == {"y": "2"}
+    assert base.spec.params == {"a": "1", "b": "2"}
+    assert base.spec.context == "/somewhere"
+
+    # override precedence: other wins on collisions
+    assert base.spec.owner == "bob"
+    assert base.status.state == "online"
+
+
+def test_project_enrich_skips_none_fields():
+    """
+    Cover the additive enrichment behavior: if the incoming project doesn't provide a value
+    for a field (e.g. status=None), enrichment must not override the current value.
+
+    This specifically covers `MlrunProject._enrich()`:
+    `if other_value is None: continue`
+    """
+    base = mlrun.projects.project.MlrunProject(
+        metadata=mlrun.projects.project.ProjectMetadata(
+            name="p1",
+        ),
+        spec=mlrun.projects.project.ProjectSpec(
+            source="repo1",
+        ),
+    )
+    base.status = mlrun.projects.project.ProjectStatus(state="offline")
+    base_status_id = id(base.status)
+
+    other = mlrun.projects.project.MlrunProject(
+        metadata=mlrun.projects.project.ProjectMetadata(
+            name="p1",
+        ),
+        spec=mlrun.projects.project.ProjectSpec(
+            source="repo1",
+        ),
+    )
+    # `status=None` is normalized by the public setter into an empty ProjectStatus(),
+    # so to cover the exact "other_value is None" branch we set the private field directly.
+    other._status = None
+    assert other.status is None
+
+    base._enrich(other)
+
+    # `other` didn't provide status, so base.status should be preserved (same object, same state)
+    assert id(base.status) == base_status_id
+    assert base.status.state == "offline"

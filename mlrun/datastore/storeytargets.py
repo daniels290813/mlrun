@@ -18,11 +18,12 @@ from mergedeep import merge
 from storey import V3ioDriver
 
 import mlrun
+import mlrun.common.model_monitoring.helpers
 from mlrun.datastore.base import DataStore
 from mlrun.datastore.datastore_profile import (
     DatastoreProfileKafkaStream,
     DatastoreProfileKafkaTarget,
-    DatastoreProfileTDEngine,
+    DatastoreProfilePostgreSQL,
     datastore_profile_read,
 )
 
@@ -48,17 +49,22 @@ def get_url_and_storage_options(path, external_storage_options=None):
     return url, DataStore._sanitize_options(storage_options)
 
 
-class TDEngineStoreyTarget(storey.TDEngineTarget):
+class TimescaleDBStoreyTarget(storey.TimescaleDBTarget):
     def __init__(self, *args, url: str, **kwargs):
         if url.startswith("ds://"):
             datastore_profile = datastore_profile_read(url)
-            if not isinstance(datastore_profile, DatastoreProfileTDEngine):
-                raise ValueError(
-                    f"Unexpected datastore profile type:{datastore_profile.type}."
-                    "Only DatastoreProfileTDEngine is supported"
+            if not isinstance(datastore_profile, DatastoreProfilePostgreSQL):
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    f"Unexpected datastore profile type: {type(datastore_profile)}. "
+                    "Only DatastoreProfilePostgreSQL is supported"
                 )
-            url = datastore_profile.dsn()
-        super().__init__(*args, url=url, **kwargs)
+            # Use the shared helper to determine the correct database name
+            # This ensures consistency with TimescaleDBConnector's database naming
+            database = mlrun.common.model_monitoring.helpers.get_tsdb_database_name(
+                datastore_profile.database
+            )
+            url = datastore_profile.dsn(database=database)
+        super().__init__(*args, dsn=url, **kwargs)
 
 
 class StoreyTargetUtils:
@@ -137,7 +143,7 @@ class KafkaStoreyTarget(storey.KafkaTarget):
             datastore_profile = datastore_profile_read(path)
             if not isinstance(
                 datastore_profile,
-                (DatastoreProfileKafkaStream, DatastoreProfileKafkaTarget),
+                DatastoreProfileKafkaStream | DatastoreProfileKafkaTarget,
             ):
                 raise mlrun.errors.MLRunInvalidArgumentError(
                     f"Unsupported datastore profile type: {type(datastore_profile)}"
@@ -174,7 +180,7 @@ class RedisNoSqlStoreyTarget(storey.NoSqlTarget):
         endpoint, uri = mlrun.datastore.targets.RedisNoSqlTarget.get_server_endpoint(
             path
         )
-        kwargs["path"] = endpoint + "/" + uri
+        kwargs["path"] = f"{endpoint}/{uri}"
         super().__init__(*args, **kwargs)
 
 

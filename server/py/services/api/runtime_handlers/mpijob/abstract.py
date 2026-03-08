@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
-from typing import Optional
 
 from kubernetes import client
 from sqlalchemy.orm import Session
 
 import mlrun.common.constants as mlrun_constants
+import mlrun.common.schemas
 import mlrun.k8s_utils
 import mlrun.utils.helpers
 from mlrun.runtimes.base import RuntimeClassMode
@@ -40,6 +40,7 @@ class AbstractMPIJobRuntimeHandler(KubeRuntimeHandler, abc.ABC):
         runtime: AbstractMPIJobRuntime,
         run: mlrun.run.RunObject,
         execution: mlrun.execution.MLClientCtx,
+        auth_info: mlrun.common.schemas.AuthInfo = None,
     ):
         if run.metadata.iteration:
             runtime.store_run(run)
@@ -47,10 +48,13 @@ class AbstractMPIJobRuntimeHandler(KubeRuntimeHandler, abc.ABC):
         meta = self._get_meta(runtime, run, True)
 
         self.add_secrets_to_spec_before_running(
-            runtime, project_name=run.metadata.project
+            runtime,
+            project_name=run.metadata.project,
+            token_name=(run.spec.auth or {}).get("token_name"),
+            auth_info=auth_info,
         )
 
-        job = self._generate_mpi_job(runtime, run, execution, meta)
+        job = self._generate_mpi_job(runtime, run, execution, meta, auth_info=auth_info)
 
         self._submit_mpijob(job, meta.namespace)
 
@@ -103,8 +107,8 @@ class AbstractMPIJobRuntimeHandler(KubeRuntimeHandler, abc.ABC):
             namespace
         )
         try:
-            resp = framework.utils.singletons.k8s.get_k8s_helper().crdapi.get_namespaced_custom_object(
-                mpi_group, mpi_version, namespace, mpi_plural, name
+            resp = framework.utils.singletons.k8s.get_k8s_helper().get_crd(
+                mpi_group, mpi_version, mpi_plural, namespace, name
             )
         except client.exceptions.ApiException as exc:
             logger.warning(
@@ -120,6 +124,7 @@ class AbstractMPIJobRuntimeHandler(KubeRuntimeHandler, abc.ABC):
         run: mlrun.run.RunObject,
         execution: mlrun.execution.MLClientCtx,
         meta: client.V1ObjectMeta,
+        auth_info: mlrun.common.schemas.AuthInfo = None,
     ) -> dict:
         pass
 
@@ -152,11 +157,11 @@ class AbstractMPIJobRuntimeHandler(KubeRuntimeHandler, abc.ABC):
             namespace
         )
         try:
-            resp = framework.utils.singletons.k8s.get_k8s_helper().crdapi.create_namespaced_custom_object(
+            resp = framework.utils.singletons.k8s.get_k8s_helper().create_crd(
                 mpi_group,
                 mpi_version,
+                mpi_plural,
                 namespace=namespace,
-                plural=mpi_plural,
                 body=job,
             )
             name = mlrun.utils.helpers.get_in(resp, "metadata.name", "unknown")
@@ -187,9 +192,9 @@ class AbstractMPIJobRuntimeHandler(KubeRuntimeHandler, abc.ABC):
         uid: str,
         name: str,
         run_state: str,
-        run: Optional[dict] = None,
+        run: dict | None = None,
         search_run: bool = True,
-        runtime_resource: Optional[dict] = None,
+        runtime_resource: dict | None = None,
     ) -> tuple[bool, str, dict]:
         _, run_state, run = super()._ensure_run_state(
             db,

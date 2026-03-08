@@ -19,7 +19,7 @@ import pytest
 
 import mlrun
 from mlrun.serving import GraphContext, QueueStep, V2ModelServer  # noqa
-from mlrun.serving.states import TaskStep
+from mlrun.serving.states import ModelRunnerStep, TaskStep
 
 from .demo_states import *  # noqa
 
@@ -131,6 +131,29 @@ def test_init_class():
     server = fn.to_mock_server()
     resp = server.test(body=5)
     assert resp == [5, "s2"], f"got unexpected result {resp}"
+
+
+def test_step_without_do():
+    fn = mlrun.new_function("tests", kind="serving")
+    graph = fn.set_topology("flow", engine="sync")
+    graph.to(name="bad", class_name="NotAStep")
+
+    server = fn.to_mock_server()
+    with pytest.raises(RuntimeError, match="step bad does not have a handler"):
+        server.test(body=5)
+
+
+# ML-11989
+def test_step_without_do_async_engine():
+    fn = mlrun.new_function("tests", kind="serving")
+    graph = fn.set_topology("flow", engine="async")
+    graph.to(name="bad", class_name="NotAStep")
+
+    with pytest.raises(
+        mlrun.errors.MLRunValueError,
+        match="Step 'bad' does not have a handler that can be called",
+    ):
+        fn.to_mock_server()
 
 
 def test_on_error():
@@ -460,3 +483,35 @@ def test_set_flow_names(
         else [step.name for step in steps]
     )
     assert list(graph.to_dict()["steps"].keys()) == expected
+
+
+def test_model_runner_with_selector():
+    function = mlrun.new_function("tests", kind="serving")
+    graph = function.set_topology("flow", engine="sync")
+    model_runner_step = ModelRunnerStep(
+        name="my_model_runner",
+    )
+    with pytest.raises(mlrun.serving.states.GraphError):
+        graph.to(model_runner_step)
+
+    with pytest.raises(mlrun.serving.states.GraphError):
+        graph.add_step(model_runner_step)
+
+    with pytest.raises(mlrun.serving.states.GraphError):
+        graph.to(name="s1", handler="(event + 1)").to(model_runner_step)
+
+
+def test_sync_flow_with_branches():
+    fn = mlrun.new_function("tests", kind="serving", project="x")
+    graph = fn.set_topology("flow", engine="sync")
+    graph.to(name="s1", class_name="Mul")
+    graph.to(name="s2", class_name="Mul")
+    graph.add_step(name="gather", class_name="Gather", after=["s1", "s2"])
+    with pytest.raises(mlrun.serving.states.GraphError):
+        fn.to_mock_server()
+
+
+# ML-11985
+def test_mrs_wraps_after():
+    after = "other-step"
+    assert ModelRunnerStep(name="my_model_runner", after=after).after == [after]

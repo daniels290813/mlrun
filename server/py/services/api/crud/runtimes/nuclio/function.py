@@ -14,14 +14,15 @@
 
 import asyncio
 import base64
+import os
 import shlex
-import typing
 
 import nuclio
 import nuclio.utils
 import requests
 
 import mlrun
+import mlrun.auth.nuclio
 import mlrun.common.constants
 import mlrun.common.constants as mlrun_constants
 import mlrun.common.schemas
@@ -34,7 +35,7 @@ from mlrun.k8s_utils import enrich_preemption_mode
 from mlrun.utils import logger
 
 import framework.utils.clients.async_nuclio
-import framework.utils.clients.iguazio
+import framework.utils.clients.iguazio.v3
 import framework.utils.singletons.k8s
 import services.api.crud.runtimes.nuclio.helpers
 import services.api.runtime_handlers
@@ -45,9 +46,9 @@ from services.api.crud.runtimes.nuclio.helpers import pure_nuclio_deployed_restr
 def deploy_nuclio_function(
     function: mlrun.runtimes.nuclio.function.RemoteRuntime,
     auth_info: mlrun.common.schemas.AuthInfo = None,
-    client_version: typing.Optional[str] = None,
-    builder_env: typing.Optional[dict] = None,
-    client_python_version: typing.Optional[str] = None,
+    client_version: str | None = None,
+    builder_env: dict | None = None,
+    client_python_version: str | None = None,
 ):
     """Deploys a nuclio function.
 
@@ -89,7 +90,7 @@ def deploy_nuclio_function(
             create_new=mlrun.mlconf.httpdb.projects.leader == "mlrun",
             watch=False,
             return_address_mode=nuclio.deploy.ReturnAddressModes.all,
-            auth_info=auth_info.to_nuclio_auth_info() if auth_info else None,
+            auth_info=mlrun.auth.nuclio.NuclioAuthInfo.from_auth_info(auth_info),
         )
     except nuclio.utils.DeployError as exc:
         if exc.err:
@@ -159,7 +160,7 @@ def get_nuclio_deploy_status(
             verbose,
             resolve_address,
             return_function_status=True,
-            auth_info=auth_info.to_nuclio_auth_info() if auth_info else None,
+            auth_info=mlrun.auth.nuclio.NuclioAuthInfo.from_auth_info(auth_info),
         )
     except requests.exceptions.ConnectionError as exc:
         mlrun.errors.raise_for_status(
@@ -185,12 +186,12 @@ async def delete_nuclio_functions_in_batches(
     function_names: list[str],
 ):
     async def delete_function(
-        nuclio_client: framework.utils.clients.iguazio.AsyncClient,
+        nuclio_client: framework.utils.clients.iguazio.v3.AsyncClient,
         project: str,
         function: str,
         _semaphore: asyncio.Semaphore,
         k8s_helper_: framework.utils.singletons.k8s.K8sHelper,
-    ) -> typing.Optional[tuple[str, str]]:
+    ) -> tuple[str, str] | None:
         async with _semaphore:
             try:
                 await nuclio_client.delete_function(name=function, project_name=project)
@@ -232,8 +233,8 @@ async def delete_nuclio_functions_in_batches(
 
 def _compile_function_config(
     function: mlrun.runtimes.nuclio.function.RemoteRuntime,
-    client_version: typing.Optional[str] = None,
-    client_python_version: typing.Optional[str] = None,
+    client_version: str | None = None,
+    client_python_version: str | None = None,
     builder_env=None,
     auth_info=None,
 ):
@@ -248,7 +249,7 @@ def _compile_function_config(
 
     :return: function name, project name, nuclio function config
     """
-
+    _enrich_config_spec(function, auth_info=auth_info)
     # resolve env vars before compiling the nuclio spec, as we need to set them in the spec
     env_dict, external_source_env_dict = _resolve_env_vars(function)
 
@@ -266,6 +267,23 @@ def _compile_function_config(
                     client_version=client_version,
                     client_python_version=client_python_version,
                 )
+            )
+
+    # Configure init container for Application runtime when source needs runtime loading
+    if function.kind == mlrun.runtimes.RuntimeKinds.application:
+        if not sidecars:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"No sidecar found for Application runtime '{function.metadata.name}'. "
+                "Application runtime requires a sidecar container to run the user's application. "
+                "Ensure the application image is set via 'spec.image' or 'with_sidecar()'."
+            )
+        if _should_fetch_source_code(function):
+            _configure_source_loader_init_container(
+                function,
+                # Application runtime has exactly one sidecar (the user's application container)
+                sidecar=sidecars[0],
+                client_version=client_version,
+                client_python_version=client_python_version,
             )
 
     nuclio_spec = nuclio.ConfigSpec(
@@ -361,27 +379,21 @@ def _apply_escaped_config(config, parent_key, items: dict):
         mlrun.utils.update_in(config, f"{parent_key}.\\{key}\\", value)
 
 
-def _resolve_env_vars(function):
+def _enrich_config_spec(
+    function, auth_info: mlrun.common.schemas.AuthInfo | None = None
+):
     # Add secret configurations to function's pod spec, if secret sources were added.
     # Needs to be here, since it adds env params, which are handled in the next lines.
     # This only needs to run if we're running within k8s context. If running in Docker, for example, skip.
     if framework.utils.singletons.k8s.get_k8s_helper(
         silent=True
     ).is_running_inside_kubernetes_cluster():
-        _add_secrets_config_to_function_spec(function)
+        token_name = mlrun.utils.get_in(function.spec, "auth.token_name", None)
+        _add_secrets_config_to_function_spec(function, token_name, auth_info)
 
+
+def _resolve_env_vars(function):
     env_dict, external_source_env_dict = function._get_nuclio_config_spec_env()
-
-    # In nuclio 1.6.0<=v<1.8.0, python runtimes default behavior was to not decode event strings
-    # Our code is counting on the strings to be decoded, so add the needed env var for those versions
-    if (
-        services.api.crud.runtimes.nuclio.helpers.is_nuclio_version_in_range(
-            "1.6.0", "1.8.0"
-        )
-        and "NUCLIO_PYTHON_DECODE_EVENT_STRINGS" not in env_dict
-    ):
-        env_dict["NUCLIO_PYTHON_DECODE_EVENT_STRINGS"] = "true"
-
     return env_dict, external_source_env_dict
 
 
@@ -629,6 +641,13 @@ def _set_misc_specs(function, nuclio_spec):
             "spec.disableDefaultHTTPTrigger", function.spec.disable_default_http_trigger
         )
 
+    # Nuclio supports spec.envFrom (mount all keys from secrets/configmaps)
+    if function.spec.env_from:
+        nuclio_spec.set_config(
+            "spec.envFrom",
+            mlrun.runtimes.pod.sanitize_attribute(function.spec.env_from),
+        )
+
 
 def _set_source_code_and_handler(function, config):
     if not function.spec.build.source:
@@ -683,6 +702,8 @@ def _set_function_name(function, config, project, tag):
 
 def _add_secrets_config_to_function_spec(
     function: mlrun.runtimes.nuclio.function.RemoteRuntime,
+    token_name: str,
+    auth_info: mlrun.common.schemas.AuthInfo | None = None,
 ):
     handler = services.api.runtime_handlers.BaseRuntimeHandler
     if function.kind in [
@@ -698,6 +719,8 @@ def _add_secrets_config_to_function_spec(
             function,
             project_name=function.metadata.project,
             encode_key_names=False,
+            token_name=token_name,
+            auth_info=auth_info,
         )
 
     elif function.kind == mlrun.runtimes.RuntimeKinds.serving:
@@ -718,10 +741,16 @@ def _add_secrets_config_to_function_spec(
                 function._secrets.get_k8s_secrets(),
                 function,
                 project_name=function.metadata.project,
+                token_name=token_name,
+                auth_info=auth_info,
             )
         else:
             handler.add_k8s_secrets_to_spec(
-                None, function, project_name=function.metadata.project
+                None,
+                function,
+                project_name=function.metadata.project,
+                token_name=token_name,
+                auth_info=auth_info,
             )
 
     else:
@@ -729,3 +758,230 @@ def _add_secrets_config_to_function_spec(
             f"Unexpected function kind {function.kind}. Expected one of: "
             f"{mlrun.runtimes.RuntimeKinds.nuclio_runtimes()}"
         )
+
+
+def _should_fetch_source_code(
+    function: mlrun.runtimes.nuclio.function.RemoteRuntime,
+) -> bool:
+    """
+    Determine if an init container is needed for source loading.
+
+    Init container is needed when:
+    - Source is a store artifact URI (store://)
+    - Source is Git or archive with pull_at_runtime=True
+
+    :param function: The function object
+    :return: True if init container is needed, False otherwise
+    """
+    # build.source may be empty after from_image() clears it on redeploy.
+    # fall back to status.application_source which preserves the original source URI.
+    source = function.spec.build.source or getattr(
+        function.status, "application_source", None
+    )
+    if not source:
+        return False
+
+    # Store artifact URIs always need init container
+    if mlrun.datastore.is_store_uri(source):
+        return True
+
+    is_git_source = source.startswith("git://")
+    is_archive_source = source.endswith(".tar.gz") or source.endswith(".zip")
+    pull_at_runtime = function.spec.build.load_source_on_run
+
+    return (is_git_source or is_archive_source) and pull_at_runtime
+
+
+def _configure_source_loader_init_container(
+    function: mlrun.runtimes.nuclio.function.RemoteRuntime,
+    sidecar: dict,
+    client_version: str | None = None,
+    client_python_version: str | None = None,
+):
+    """
+    Configure an init container for Application runtime to load source code at runtime.
+
+    This function sets up a Kubernetes init container that runs before the main sidecar
+    container starts. The init container is responsible for fetching source code from
+    remote locations (store:// URIs, git repos, archives) and extracting it to a shared
+    volume that the sidecar can access.
+
+    The setup involves:
+    1. Creating an emptyDir volume shared between init container and sidecar
+    2. Building an init container spec that runs `mlrun load-source` command
+    3. Adding the init container to the function's Nuclio spec
+    4. Patching the sidecar to mount the shared volume and set PYTHONPATH
+
+    :param function: The function object to configure
+    :param sidecar: The sidecar container dict (the user's application container)
+    :param client_version: Client version for resolving the init container image
+    :param client_python_version: Client Python version for resolving the init container image
+    """
+    source = function.spec.build.source or getattr(
+        function.status, "application_source", None
+    )
+    workdir = function.spec.workdir
+    target_dir = (
+        function.spec.build.source_code_target_dir
+        or mlrun.common.constants.DEFAULT_SOURCE_CODE_TARGET_DIR
+    )
+
+    # Create shared volume for source code
+    volume_name = mlrun.common.constants.SOURCE_CODE_VOLUME_NAME
+    volume = {"name": volume_name, "emptyDir": {}}
+    volume_mount = {"name": volume_name, "mountPath": target_dir}
+
+    # Add volume to function spec so both init container and sidecar can access it
+    function.spec.with_volumes(volume)
+    function.spec.with_volume_mounts(volume_mount)
+
+    # Build the init container spec with mlrun load-source command
+    init_container = _build_source_loader_init_container(
+        function=function,
+        source=source,
+        target_dir=target_dir,
+        volume_mount=volume_mount,
+        client_version=client_version,
+        client_python_version=client_python_version,
+    )
+
+    # Add init container to function spec (idempotently - replaces if exists)
+    _ensure_source_loader_init_container(function, init_container)
+
+    _patch_sidecar_for_source(
+        sidecar=sidecar,
+        volume_name=volume_name,
+        volume_mount=volume_mount,
+        target_dir=target_dir,
+        workdir=workdir,
+    )
+
+    logger.debug(
+        "Configured source loader init container",
+        project=function.metadata.project,
+        function=function.metadata.name,
+        source=source,
+        target_dir=target_dir,
+        workdir=function.spec.workdir,
+    )
+
+
+def _build_source_loader_init_container(
+    function: mlrun.runtimes.nuclio.function.RemoteRuntime,
+    source: str,
+    target_dir: str,
+    volume_mount: dict,
+    client_version: str | None = None,
+    client_python_version: str | None = None,
+) -> dict:
+    """
+    Build the init container spec for loading source code.
+
+    :param function: The function object
+    :param source: Source URI to load
+    :param target_dir: Target directory for source code
+    :param volume_mount: Volume mount configuration
+    :param client_version: Client version for image resolution
+    :param client_python_version: Client Python version for image resolution
+    :return: Init container specification dict
+    """
+    project = function.metadata.project
+
+    init_container_image = services.api.utils.builder.resolve_and_enrich_image_target(
+        mlrun.mlconf.default_base_image,
+        client_version=client_version,
+        client_python_version=client_python_version,
+    )
+
+    return {
+        "name": mlrun.common.constants.SOURCE_LOADER_INIT_CONTAINER_NAME,
+        "image": init_container_image,
+        "command": ["mlrun", "load-source"],
+        "args": [source, "--project", project, "--target", target_dir],
+        "env": [
+            {"name": "MLRUN_PROJECT", "value": project},
+            {"name": "MLRUN_DBPATH", "value": mlrun.mlconf.httpdb.api_url},
+        ],
+        "volumeMounts": [volume_mount],
+    }
+
+
+def _ensure_source_loader_init_container(
+    function: mlrun.runtimes.nuclio.function.RemoteRuntime,
+    init_container: dict,
+):
+    """
+    Add the source loader init container to the function spec idempotently.
+
+    This function ensures the source loader init container is present in the Nuclio
+    function spec. If an init container with the same name already exists, it will
+    be replaced with the new configuration. This enables safe re-deployment without
+    duplicating init containers.
+
+    :param function: The function object to configure
+    :param init_container: Init container specification
+    """
+    init_container_name = init_container.get("name")
+    if not init_container_name:
+        raise mlrun.errors.MLRunInvalidArgumentError("Init container name is required")
+    init_containers = function.spec.config.setdefault("spec.initContainers", [])
+
+    for index, container in enumerate(init_containers):
+        if container.get("name") == init_container_name:
+            init_containers[index] = init_container
+            break
+    else:
+        init_containers.append(init_container)
+
+
+def _patch_sidecar_for_source(
+    sidecar: dict,
+    volume_name: str,
+    volume_mount: dict,
+    target_dir: str,
+    workdir: str | None = None,
+):
+    """
+    Patch sidecar container with volume mount, workingDir, and PYTHONPATH.
+
+    :param sidecar: The sidecar container dict
+    :param volume_name: Name of the source volume
+    :param volume_mount: Volume mount configuration
+    :param target_dir: Target directory where source code is extracted
+    :param workdir: Working directory relative to target_dir (e.g. 'subdir') or absolute path
+                    on the container filesystem. When set, the sidecar runs from this directory
+                    instead of the target_dir root.
+    """
+    # Add volume mount idempotently
+    sidecar_mounts = sidecar.setdefault("volumeMounts", [])
+    if not any(vm.get("name") == volume_name for vm in sidecar_mounts):
+        sidecar_mounts.append(volume_mount)
+
+    # Resolve the effective working directory for the sidecar.
+    # workdir can be relative (joined with target_dir) or absolute (used as-is).
+    if workdir:
+        if os.path.isabs(workdir):
+            resolved_workdir = workdir
+        else:
+            resolved_workdir = os.path.join(target_dir, workdir)
+    else:
+        resolved_workdir = target_dir
+
+    sidecar["workingDir"] = resolved_workdir
+
+    # Set PYTHONPATH so the sidecar can import modules from the source directory.
+    # If PYTHONPATH already exists (user-defined), prepend our path to preserve theirs.
+    sidecar_env = sidecar.setdefault("env", [])
+    pythonpath_env = next(
+        (e for e in sidecar_env if e.get("name") == "PYTHONPATH"), None
+    )
+    if pythonpath_env:
+        existing_path = pythonpath_env.get("value", "")
+        if resolved_workdir not in existing_path.split(":"):
+            pythonpath_env["value"] = (
+                f"{resolved_workdir}:{existing_path}"
+                if existing_path
+                else resolved_workdir
+            )
+    else:
+        sidecar_env.append({"name": "PYTHONPATH", "value": resolved_workdir})

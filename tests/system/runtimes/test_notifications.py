@@ -42,7 +42,12 @@ class TestNotifications(tests.system.base.TestMLRunSystem):
             last_updated_time = datetime.datetime.fromisoformat(
                 runs[0]["status"]["last_update"]
             )
-            assert last_updated_time >= end_time
+            # Allow for small timing differences (up to 10ms) due to clock precision
+            time_diff = (last_updated_time - end_time).total_seconds()
+            assert time_diff >= -0.01, (
+                f"last_update ({last_updated_time}) should be >= end_time ({end_time}), "
+                f"but differs by {time_diff:.6f} seconds"
+            )
 
             assert len(runs[0]["status"]["notifications"]) == 2
             for notification_name, notification in runs[0]["status"][
@@ -248,9 +253,9 @@ class TestNotifications(tests.system.base.TestMLRunSystem):
             assert run.status.state == mlrun.common.runtimes.constants.RunStates.error
 
             notifications = run.status.notifications
-            assert (
-                len(notifications) == 1
-            ), f"Expected one notification, got: {len(notifications)}"
+            assert len(notifications) == 1, (
+                f"Expected one notification, got: {len(notifications)}"
+            )
 
             # Validate final failure notification
             notification = notifications[notification_name]

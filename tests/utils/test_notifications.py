@@ -15,11 +15,12 @@
 import asyncio
 import builtins
 import unittest.mock
+from collections.abc import Callable
 from contextlib import nullcontext as does_not_raise
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any
 
 import aiohttp
 import pytest
@@ -771,7 +772,7 @@ def test_slack_notification(runs, expected):
             "https://api.github.com/repos/test-repo/issues/test-issue/comments",
             {
                 "Accept": "application/vnd.github.v3+json",
-                "Authorization": "token test-token",
+                mlrun.common.schemas.HeaderNames.authorization: "token test-token",
             },
         ),
         (
@@ -1014,9 +1015,9 @@ def test_notification_validation_defaults(monkeypatch):
 
     for notification_field, expected_value in notification_fields.items():
         value = getattr(notification, notification_field)
-        assert (
-            value == expected_value
-        ), f"{notification_field} field value is {value}, expected {expected_value}"
+        assert value == expected_value, (
+            f"{notification_field} field value is {value}, expected {expected_value}"
+        )
 
 
 @pytest.mark.parametrize(
@@ -1391,7 +1392,7 @@ def _mock_async_response(monkeypatch, method, result):
 
 
 def _generate_run_result(
-    state: str, error: Optional[str] = None, results: Optional[dict] = None
+    state: str, error: str | None = None, results: dict | None = None
 ):
     run_example = {
         "status": {
@@ -1578,6 +1579,51 @@ class TestMailNotification:
                     match="Parameter 'use_tls' must be a boolean for MailNotification",
                 ),
             ),
+            (  # missing username and password should pass validation - no auth case
+                {
+                    "server_host": "smtp.gmail.com",
+                    "server_port": 587,
+                    "sender_address": "sender@example.com",
+                    "username": "",
+                    "password": "",
+                    "email_addresses": "a@example.com",
+                    "use_tls": True,
+                    "validate_certs": True,
+                    "start_tls": False,
+                },
+                does_not_raise(),
+            ),
+            (  # missing password should pass validation - some servers allow username only auth
+                {
+                    "server_host": "smtp.gmail.com",
+                    "server_port": 587,
+                    "sender_address": "sender@example.com",
+                    "username": "user",
+                    "password": "",
+                    "email_addresses": "a@example.com",
+                    "use_tls": True,
+                    "validate_certs": True,
+                    "start_tls": False,
+                },
+                does_not_raise(),
+            ),
+            (  # missing username and password provided should fail validation
+                {
+                    "server_host": "smtp.gmail.com",
+                    "server_port": 587,
+                    "sender_address": "sender@example.com",
+                    "username": "",
+                    "password": "pass",
+                    "email_addresses": "a@example.com",
+                    "use_tls": True,
+                    "validate_certs": True,
+                    "start_tls": False,
+                },
+                pytest.raises(
+                    ValueError,
+                    match="Parameter 'username' is required when 'password' is provided for MailNotification",
+                ),
+            ),
         ],
     )
     def test_validate_mail_params(self, params, expectation):
@@ -1628,6 +1674,19 @@ class TestMailNotification:
         ["name", "params", "message", "severity", "expected"],
         [
             (
+                "no_username_or_password",
+                {},
+                "test-message",
+                "info",
+                {
+                    "subject": "[info] test-message",
+                    "body": MOCKED_HTML,
+                    # commented out to reflect the fact that username and password are not required
+                    # "username": None,
+                    # "password": None,
+                },
+            ),
+            (
                 "empty_params",
                 {},
                 "test-message",
@@ -1635,6 +1694,8 @@ class TestMailNotification:
                 {
                     "subject": "[info] test-message",
                     "body": MOCKED_HTML,
+                    "username": None,
+                    "password": None,
                 },
             ),
             (
@@ -1645,18 +1706,98 @@ class TestMailNotification:
                 {
                     "subject": "[warning] test-message",
                     "body": f"runs: {MOCKED_HTML}",
+                    "username": None,
+                    "password": None,
+                },
+            ),
+            (
+                "empty_auth_params",
+                {"username": "", "password": ""},
+                "test-message",
+                "info",
+                {
+                    "subject": "[info] test-message",
+                    "body": MOCKED_HTML,
+                    "username": None,
+                    "password": None,
+                },
+            ),
+            (
+                "with_auth_params",
+                {"username": "user", "password": "pass"},
+                "test-message",
+                "info",
+                {
+                    "subject": "[info] test-message",
+                    "body": MOCKED_HTML,
+                    "username": "user",
+                    "password": "pass",
                 },
             ),
         ],
     )
     async def test_push(self, name, params, message, severity, expected):
-        mlrun.utils.logger.debug(f"Testing {name}")
+        params.update(
+            {
+                "sender_address": "test@example.com",
+                "server_host": "smtp.example.com",
+            }
+        )
         notification = mail.MailNotification(params=params)
-        notification._send_email = unittest.mock.AsyncMock()
         notification._get_html = unittest.mock.MagicMock(return_value=self.MOCKED_HTML)
-        await notification.push(message, severity, [])
+
+        with unittest.mock.patch(
+            "aiosmtplib.send", new_callable=unittest.mock.AsyncMock
+        ):
+            await notification.push(message, severity, [])
         assert notification.params["subject"] == expected["subject"]
         assert notification.params["body"] == expected["body"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ["username", "password", "expected_auth_kwargs"],
+        [
+            ("", "", {}),
+            (None, None, {}),
+            ("user", None, {"username": "user"}),
+            ("user", "pass", {"username": "user", "password": "pass"}),
+        ],
+    )
+    async def test_send_email_auth_handling(
+        self, username, password, expected_auth_kwargs, monkeypatch: pytest.MonkeyPatch
+    ):
+        send_mock = unittest.mock.AsyncMock()
+        monkeypatch.setattr(mail.aiosmtplib, "send", send_mock)
+
+        await mail.MailNotification(
+            params={
+                "server_host": "smtp.example.com",
+                "server_port": 25,
+                "sender_address": "",
+                "username": username,
+                "password": password,
+                "use_tls": False,
+                "validate_certs": True,
+                "start_tls": False,
+            }
+        ).push(
+            message="Test Message",
+            severity="info",
+        )
+
+        assert send_mock.await_count == 1
+        assert send_mock.await_args.kwargs["hostname"] == "smtp.example.com"
+        assert send_mock.await_args.kwargs["port"] == 25
+        assert send_mock.await_args.kwargs["use_tls"] is False
+        assert send_mock.await_args.kwargs["start_tls"] is False
+        assert send_mock.await_args.kwargs["validate_certs"] is True
+
+        for key, value in expected_auth_kwargs.items():
+            assert send_mock.await_args.kwargs.get(key) == value
+
+        for key in ("username", "password"):
+            if key not in expected_auth_kwargs:
+                assert key not in send_mock.await_args.kwargs
 
 
 class DummyResponse:
@@ -1669,15 +1810,15 @@ class DummyResponse:
 
 class DummySession:
     def __init__(self, json_serialize: Callable) -> None:
-        self.request_args: Optional[dict[str, Any]] = None
+        self.request_args: dict[str, Any] | None = None
         self._json_serialize = json_serialize
 
     async def post(
         self,
         url: str,
-        headers: Optional[dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         json: Any = None,
-        ssl: Optional[bool] = None,
+        ssl: bool | None = None,
     ) -> DummyResponse:
         await self._request(
             "post",
@@ -1691,9 +1832,9 @@ class DummySession:
     async def put(
         self,
         url: str,
-        headers: Optional[dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         json: Any = None,
-        ssl: Optional[bool] = None,
+        ssl: bool | None = None,
     ) -> DummyResponse:
         await self._request(
             "put",
@@ -1759,10 +1900,10 @@ def client_session(monkeypatch: pytest.MonkeyPatch) -> None:
 class DummyRun:
     project: str = "proj"
     name: str = "run1"
-    host: Optional[str] = None
+    host: str | None = None
     state: str = "s"
-    error: Optional[str] = None
-    results: Optional[list[Any]] = None
+    error: str | None = None
+    results: list[Any] | None = None
     metadata: dict[str, Any] = field(init=False)
     status: dict[str, Any] = field(init=False)
 
@@ -1785,7 +1926,7 @@ class DummyAlert:
     name: str
     project: str
     severity: str
-    summary: Optional[str] = None
+    summary: str | None = None
 
 
 @dataclass
@@ -1887,7 +2028,7 @@ async def test_override_list_passthrough(client_session: Any) -> None:
 async def test_override_values(
     client_session: Any,
     override_body: dict[str, Any],
-    runs: Optional[list[Any]],
+    runs: list[Any] | None,
     key: str,
     expected: Any,
 ) -> None:
@@ -1914,8 +2055,8 @@ async def test_override_values(
 async def test_ssl_logic(
     client_session: Any,
     url: str,
-    verify_ssl: Optional[bool],
-    expected_ssl: Optional[bool],
+    verify_ssl: bool | None,
+    expected_ssl: bool | None,
 ) -> None:
     params: dict[str, Any] = {"url": url}
     if verify_ssl is not None:

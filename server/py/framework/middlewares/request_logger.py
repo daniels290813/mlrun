@@ -53,7 +53,7 @@ class RequestLoggerMiddleware:
             return await self.app(scope, receive, send)
 
         headers = MutableHeaders(scope=scope)
-        request_id = headers.get("x-request-id") or str(uuid.uuid4())
+        request_id = self._resolve_context_id(headers)
         context_id_var.set(request_id)
         # limit request id to 36 characters (uuid4 length) to avoid log lines being too long
         request_id = request_id[:36]
@@ -124,12 +124,23 @@ class RequestLoggerMiddleware:
     def _log_headers(self, headers: MutableHeaders):
         headers_to_log = headers.mutablecopy()
         headers_to_omit = [
-            "authorization",
-            "cookie",
-            "x-v3io-session-key",
-            "x-v3io-access-key",
+            mlrun.common.schemas.HeaderNames.authorization,
+            mlrun.common.schemas.HeaderNames.cookie,
+            mlrun.common.schemas.HeaderNames.v3io_session_key,
+            mlrun.common.schemas.HeaderNames.v3io_access_key,
         ]
         for name, values in headers.items():
             if name in headers_to_omit:
                 del headers_to_log[name]
         return dict(headers_to_log.items())
+
+    @staticmethod
+    def _resolve_context_id(headers: MutableHeaders) -> str:
+        context_id = (
+            headers.get(mlrun.common.schemas.HeaderNames.igz_ctx)
+            or headers.get(mlrun.common.schemas.HeaderNames.igz_ctx_legacy)
+            or headers.get(mlrun.common.schemas.HeaderNames.x_request_id)
+        )
+        if not context_id:
+            context_id = str(uuid.uuid4())
+        return context_id

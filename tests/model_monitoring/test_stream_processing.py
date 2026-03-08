@@ -19,7 +19,7 @@ import mlrun.model_monitoring
 from mlrun.datastore.datastore_profile import (
     DatastoreProfile,
     DatastoreProfileKafkaStream,
-    DatastoreProfileTDEngine,
+    DatastoreProfilePostgreSQL,
     DatastoreProfileV3io,
 )
 from mlrun.model_monitoring.stream_processing import EventStreamProcessor
@@ -29,8 +29,13 @@ from mlrun.model_monitoring.stream_processing import EventStreamProcessor
     "tsdb_profile",
     [
         DatastoreProfileV3io(name="v3io-tsdb-test"),
-        DatastoreProfileTDEngine(
-            name="tdengine-test", user="root", host="localhost", port=6041
+        DatastoreProfilePostgreSQL(
+            name="postgresql-tsdb-test",
+            user="testuser",
+            password="testpass",
+            host="localhost",
+            port=5432,
+            database="postgres",
         ),
     ],
 )
@@ -44,8 +49,11 @@ from mlrun.model_monitoring.stream_processing import EventStreamProcessor
     ],
 )
 def test_plot_monitoring_serving_graph(
-    tsdb_profile: DatastoreProfile, stream_profile: DatastoreProfile
+    monkeypatch: pytest.MonkeyPatch,
+    tsdb_profile: DatastoreProfile,
+    stream_profile: DatastoreProfile,
 ) -> None:
+    monkeypatch.setattr(mlrun.mlconf, "system_id", "123456")
     project_name = "test-stream-processing"
     project = mlrun.get_or_create_project(project_name, allow_cross_project=True)
 

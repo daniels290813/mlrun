@@ -44,7 +44,7 @@ def _normalize_dict_for_v3io_frames(event: dict[str, Any]) -> dict[str, Any]:
         items = {}
         for k, v in d.items():
             new_key = norm_key(k)
-            full_key = f"{parent_key}.{new_key}" if parent_key else new_key
+            full_key = f"{parent_key}:{new_key}" if parent_key else new_key
             if isinstance(v, dict):
                 items.update(flatten_dict(v, full_key))
             else:
@@ -151,11 +151,9 @@ class FilterAndUnpackKeys(mlrun.feature_store.steps.MapClass):
 
 
 class ErrorExtractor(mlrun.feature_store.steps.MapClass):
-    def __init__(self, **kwargs):
-        """
-        Prepare the event for insertion into the errors TSDB table.
-        """
-        super().__init__(**kwargs)
+    """
+    Prepare the event for insertion into the errors TSDB table.
+    """
 
     def do(self, event):
         error = event.get("error")

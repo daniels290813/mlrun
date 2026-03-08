@@ -26,9 +26,10 @@ import urllib3.exceptions
 import mlrun.artifacts.base
 import mlrun.config
 import mlrun.db.httpdb
+from mlrun.common.types import AuthenticationMode
 
 
-class SomeEnumClass(str, enum.Enum):
+class SomeEnumClass(enum.StrEnum):
     value1 = "value1"
     value2 = "value2"
 
@@ -210,34 +211,39 @@ def test_resolve_artifacts_to_tag_objects():
 
 
 @pytest.mark.parametrize(
-    "path, call_amount",
+    "method, path, call_amount",
     [
         (
+            "POST",
             "projects/default/artifacts/uid/tag",
             1 + mlrun.mlconf.http_retry_defaults.max_retries,
         ),
         (
+            "POST",
             "projects/default/artifacts/8bbaaa9f-919e-4438-8e6c-edbf6d37f3bf/v1",
             1 + mlrun.mlconf.http_retry_defaults.max_retries,
         ),
         (
+            "POST",
             "/projects/default/artifacts/uid/tag",
             1 + mlrun.mlconf.http_retry_defaults.max_retries,
         ),
-        ("run/default/uid", 1 + mlrun.mlconf.http_retry_defaults.max_retries),
+        ("POST", "run/default/uid", 1 + mlrun.mlconf.http_retry_defaults.max_retries),
         (
+            "POST",
             "run/default/8bbaaa9f-919e-4438-8e6c-edbf6d37f3bf",
             1 + mlrun.mlconf.http_retry_defaults.max_retries,
         ),
-        ("/run/default/uid", 1 + mlrun.mlconf.http_retry_defaults.max_retries),
-        ("/not/retriable", 1),
+        ("POST", "/run/default/uid", 1 + mlrun.mlconf.http_retry_defaults.max_retries),
+        # non-retriable
+        ("POST", "/not/retriable", 1),
+        ("PUT", "user-secrets/tokens", 1),
+        ("PUT", "/user-secrets/tokens", 1),
     ],
 )
-def test_retriable_post_requests(path, call_amount):
+def test_retriable_requests(method, path, call_amount):
     mlrun.mlconf.httpdb.retry_api_call_on_exception = "enabled"
     db = mlrun.db.httpdb.HTTPRunDB("https://fake-url")
-    # init the session to make sure it will be reinitialized when needed
-    db.session = db._init_session(False)
     original_request = requests.Session.request
     requests.Session.request = unittest.mock.Mock()
     requests.Session.request.side_effect = ConnectionRefusedError(
@@ -249,7 +255,7 @@ def test_retriable_post_requests(path, call_amount):
         # Catching also MLRunRuntimeError as if the exception inherits from requests.RequestException, it will be
         # wrapped with MLRunRuntimeError
         with pytest.raises(ConnectionRefusedError):
-            db.api_call("POST", path)
+            db.api_call(method, path)
 
     assert requests.Session.request.call_count == call_amount
     requests.Session.request = original_request
@@ -310,9 +316,9 @@ def test_watch_logs_continue():
         # the first log line is printed with a newline
         assert newprint.getvalue() == "Firstrow\nSecondrowThirdrowSmiley😆�LastRow"
 
-    assert (
-        adapter.call_count == len(log_lines) + 1
-    ), "should have called the adapter once per log line, and one more time at the end of log"
+    assert adapter.call_count == len(log_lines) + 1, (
+        "should have called the adapter once per log line, and one more time at the end of log"
+    )
 
 
 @pytest.mark.parametrize(
@@ -330,13 +336,29 @@ def test_watch_logs_continue():
             {"page": 2},
             {"page": 2, "page-size": mlrun.mlconf.httpdb.pagination.default_page_size},
         ),
-        # `limit` turns into `page-size`
-        ({"limit": 5}, {"page": 1, "page-size": 5}),
-        # `page-size` overrides limit
-        ({"page-size": 2, "limit": 5}, {"page": 1, "page-size": 2}),
     ],
 )
 def test_resolve_page_params(params, expected_page_params):
     db = mlrun.db.httpdb.HTTPRunDB("https://fake-url")
     resolved_page_params = db._resolve_page_params(params)
     assert expected_page_params == resolved_page_params
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "store_secret_token",
+        "store_secret_tokens",
+        "list_secret_tokens",
+        "delete_secret_token",
+    ],
+)
+def test_restricted_methods_in_wrong_mode(monkeypatch, method_name):
+    mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.BASIC
+    db = mlrun.db.httpdb.HTTPRunDB("https://fake-url")
+    method = getattr(db, method_name)
+    with pytest.raises(mlrun.errors.MLRunRuntimeError) as exc_info:
+        method(None)
+    assert "This method is only supported in an Iguazio V4 system" in str(
+        exc_info.value
+    )

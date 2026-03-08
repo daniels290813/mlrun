@@ -106,7 +106,7 @@ def test_list_pipelines_formats(
         expected_runs = [
             mlrun_pipelines.models.PipelineRun(run.to_dict()) for run in runs
         ]
-        expected_runs = services.api.crud.Pipelines()._format_runs(
+        expected_runs = services.api.crud.Pipelines()._format_runs_concurrently(
             runs=expected_runs,
             format_=format_,
             kfp_client=kfp_client_mock,
@@ -238,12 +238,10 @@ def test_list_pipelines_time_fields_default(
 
     assert response["created_at"] == str(created_at)
     assert not response["finished_at"], (
-        "Expected value to be None after format,"
-        " since field has not been specified yet"
+        "Expected value to be None after format, since field has not been specified yet"
     )
     assert not response["scheduled_at"], (
-        "Expected value to be None after format,"
-        " since field has not been specified yet"
+        "Expected value to be None after format, since field has not been specified yet"
     )
 
 
@@ -291,7 +289,7 @@ def test_list_pipelines_name_contains(
         },
     )
 
-    expected_runs = services.api.crud.Pipelines()._format_runs(
+    expected_runs = services.api.crud.Pipelines()._format_runs_concurrently(
         runs=[
             mlrun_pipelines.models.PipelineRun(run.to_dict())
             for run in runs
@@ -346,6 +344,7 @@ def test_create_pipeline(
     k8s_secrets_mock: services.api.tests.unit.conftest.K8sSecretsMock,
 ) -> None:
     project = "getting-started-tutorial-iguazio"
+    experiment_name = "my-experiment"
     pipeline_file_path = (
         services.api.tests.unit.conftest.tests_root_directory
         / "api"
@@ -355,15 +354,17 @@ def test_create_pipeline(
     with open(str(pipeline_file_path)) as file:
         contents = file.read()
     _mock_pipelines_creation(kfp_client_mock)
-
+    params = {"experiment": experiment_name}
     response = client.post(
         f"projects/{project}/pipelines",
         data=contents,
+        params=params,
         headers={"content-type": "application/yaml"},
         auth=BasicAuth(username="admin", password="mock_token"),
     )
     response_body = response.json()
     assert response_body["id"] == "some-run-id"
+    assert response_body["name"].startswith(f"{project}-{experiment_name}")
     assert k8s_secrets_mock.auth_secrets_map[
         "secret-ref-V3IO_ACCESS_KEY-some-session"
     ] == {

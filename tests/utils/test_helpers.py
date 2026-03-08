@@ -17,8 +17,7 @@ import json
 import re
 import unittest.mock
 from contextlib import nullcontext as does_not_raise
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pandas import Timedelta, Timestamp
@@ -35,20 +34,25 @@ from mlrun.utils import logger
 from mlrun.utils.helpers import (
     StorePrefix,
     enrich_image_url,
+    ensure_batch_job_suffix,
     extend_hub_uri_if_needed,
     get_data_from_path,
     get_parsed_docker_registry,
     get_pretty_types_names,
     get_regex_list_as_string,
+    lock_hub_uri_version,
+    merge_requirements,
     parse_artifact_uri,
     remove_tag_from_artifact_uri,
     resolve_image_tag_suffix,
+    set_auth_token_name,
     set_data_by_path,
     split_path,
     str_to_timestamp,
     template_artifact_path,
     update_in,
     validate_artifact_key_name,
+    validate_function_name,
     validate_tag_name,
     validate_v3io_stream_consumer_group,
     verify_field_regex,
@@ -78,11 +82,11 @@ def test_retry_until_successful_fatal_failure():
     [
         (
             "2024-11-11 07:44:56.255000+0000",
-            datetime(2024, 11, 11, 7, 44, 56, 255000, tzinfo=timezone.utc),
+            datetime(2024, 11, 11, 7, 44, 56, 255000, tzinfo=UTC),
         ),
         (
             "2024-11-11 07:44:56+0000",
-            datetime(2024, 11, 11, 7, 44, 56, tzinfo=timezone.utc),
+            datetime(2024, 11, 11, 7, 44, 56, tzinfo=UTC),
         ),
     ],
 )
@@ -245,6 +249,23 @@ def test_extend_hub_uri(rundb_mock, case):
     if is_hub_url:
         expected_output = hub_url + expected_output
     assert expected_output == output
+
+
+@pytest.mark.parametrize(
+    "uri, locked_version, expected",
+    [
+        ("hub://function-name", "1.2.3", "hub://function-name:1.2.3"),
+        ("hub://function-name:latest", "1.2.3", "hub://function-name:1.2.3"),
+        (
+            "hub://source/function-name:latest",
+            "2.0.0",
+            "hub://source/function-name:2.0.0",
+        ),
+        ("hub://function-name:0.0.1", "2.0.0", "hub://function-name:0.0.1"),
+    ],
+)
+def test_lock_hub_uri_version(uri, locked_version, expected):
+    assert lock_hub_uri_version(uri, locked_version) == expected
 
 
 @pytest.mark.parametrize(
@@ -805,6 +826,14 @@ def test_validate_v3io_consumer_group(value, expected):
             "images_registry": "",
             "expected_output": "mlrun/mlrun:1.11.0",
         },
+        {
+            "image": "mlrun/ml-base",
+            "client_version": "1.10.0",
+            "client_python_version": "3.9.13",
+            "images_tag": None,
+            "expected_output": "mlrun/mlrun:1.10.0-py39",
+            "images_to_enrich_registry": "",
+        },
         # version < 1.10.0 — ml-base image is still valid, image should remain unchanged
         {
             "image": "mlrun/ml-base",
@@ -858,6 +887,31 @@ def test_validate_v3io_consumer_group(value, expected):
             "client_python_version": "3.11.13",
             "images_tag": None,
             "expected_output": "mlrun/mlrun-kfp:1.10.0",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun-kfp",
+            "client_version": "1.10.0-rc1",
+            "client_python_version": "3.11.13",
+            "images_tag": None,
+            "expected_output": "mlrun/mlrun-kfp:1.10.0-rc1",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun-kfp",
+            "client_version": "1.9.0",
+            "client_python_version": "3.9.10",
+            "images_tag": None,
+            # no -py suffix as 1.9 has no dual python support
+            "expected_output": "mlrun/mlrun-kfp:1.9.0",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun-kfp:1.10.0-rc37",
+            "client_version": "1.10.0-rc37",
+            "client_python_version": "3.9.13",
+            "images_tag": None,
+            "expected_output": "mlrun/mlrun-kfp:1.10.0-rc37-py39",
             "images_to_enrich_registry": "",
         },
     ],
@@ -1576,16 +1630,16 @@ def test_join_urls(base_url, path, expected_result):
     [
         (None, None),
         # no timezone
-        ("2025-01-15T11:00:00", datetime(2025, 1, 15, 11, 0, 0, tzinfo=timezone.utc)),
+        ("2025-01-15T11:00:00", datetime(2025, 1, 15, 11, 0, 0, tzinfo=UTC)),
         # timezone-aware datetime (UTC+2), should convert to UTC
         (
             "2025-01-15T11:00:00+02:00",
-            datetime(2025, 1, 15, 9, 0, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 15, 9, 0, 0, tzinfo=UTC),
         ),
         # already in UTC
         (
             "2025-01-15T11:00:00+00:00",
-            datetime(2025, 1, 15, 11, 0, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 15, 11, 0, 0, tzinfo=UTC),
         ),
     ],
 )
@@ -1600,7 +1654,7 @@ def test_datetime_from_iso(input_time, expected_output):
         (datetime(2025, 3, 13, 12, 30, 45, 123456), "2025-03-13 12:30:45.123456+00:00"),
         # Test for datetime with UTC timezone info
         (
-            datetime(2025, 3, 13, 12, 30, 45, 123456, tzinfo=timezone.utc),
+            datetime(2025, 3, 13, 12, 30, 45, 123456, tzinfo=UTC),
             "2025-03-13 12:30:45.123456+00:00",
         ),
         # Test for datetime with a non-UTC timezone offset (+05:00), should keep the original timezone
@@ -1741,10 +1795,10 @@ def test_format_datetime(dt, expected):
     ],
 )
 def test_get_kfp_list_runs_filter(
-    input_start_date: Optional[str],
-    input_end_date: Optional[str],
-    input_existing_filter_json: Optional[str],
-    input_experiment_id: Optional[str],
+    input_start_date: str | None,
+    input_end_date: str | None,
+    input_existing_filter_json: str | None,
+    input_experiment_id: str | None,
     expected_filter_object: dict,
 ):
     experiment_ids = []
@@ -1824,11 +1878,47 @@ def test_remove_tag_from_artifact_uri(input_uri, expected_output):
         ),  # nested dict
         ("a.missing", {"a": {"b": 1}}, {}),  # partially missing nested path
         (None, {"x": 1, "y": 2}, {"x": 1, "y": 2}),  # path is None
+        ("x", [{"x": 1}, {"x": 2}], [1, 2]),  # list of dicts with simple key
+        (None, [1, 2, 3], [1, 2, 3]),  # list with None path
+        (None, [[1, 2], [3, 4]], [[1, 2], [3, 4]]),  # list of lists with None path
+        (
+            "a.b",
+            [{"a": {"b": 10}}, {"a": {"b": 20}}],
+            [10, 20],
+        ),  # list of dicts with nested path
+        (None, [{"x": 1}, {"y": 2}], [{"x": 1}, {"y": 2}]),  # list with None path
+        (None, ["x"], ["x"]),  # list of strings with None path
     ],
 )
 def test_get_data_from_path_parametrized(path, data, expected):
     path_as_list = split_path(path)
     assert get_data_from_path(path_as_list, data) == expected
+
+
+def test_get_data_from_path_invalid_path_type():
+    # Test that invalid path type raises MLRunInvalidArgumentError
+    with pytest.raises(
+        mlrun.errors.MLRunInvalidArgumentError,
+        match="Expected path be of type str or list of str or None",
+    ):
+        get_data_from_path(123, {"x": 1})  # path is int, should raise error
+
+    with pytest.raises(
+        mlrun.errors.MLRunInvalidArgumentError,
+        match="Expected path be of type str or list of str or None",
+    ):
+        get_data_from_path(
+            {"invalid": "path"}, {"x": 1}
+        )  # path is dict, should raise error
+
+    # Test that using a path with a list of non-dict values raises error
+    with pytest.raises(
+        mlrun.errors.MLRunInvalidArgumentError,
+        match="If data is a list of non-dict values, path must be None",
+    ):
+        get_data_from_path(
+            ["x"], [1, 2, 3]
+        )  # path with list of ints, should raise error
 
 
 @pytest.mark.parametrize(
@@ -1845,6 +1935,20 @@ def test_get_data_from_path_parametrized(path, data, expected):
             {"new_key": 123},
             {"existing": "data", "new_key": 123},
         ),
+        # List of dicts - simple path
+        (
+            "b",
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            [10, 20, 30],
+            [{"a": 1, "b": 10}, {"a": 2, "b": 20}, {"a": 3, "b": 30}],
+        ),
+        # List of dicts - nested path
+        (
+            "outer.b",
+            [{"outer": {"a": 1}}, {"outer": {"a": 2}}],
+            [10, 20],
+            [{"outer": {"a": 1, "b": 10}}, {"outer": {"a": 2, "b": 20}}],
+        ),
     ],
 )
 def test_set_data_by_path_success(path, initial_data, value, expected_data):
@@ -1854,23 +1958,184 @@ def test_set_data_by_path_success(path, initial_data, value, expected_data):
 
 
 @pytest.mark.parametrize(
-    "path, value, exc_type, exc_msg",
+    "path, initial_data, value, exc_type, exc_msg",
     [
         # For path=None, test that non-dict value raises ValueError
-        (None, "not a dict", ValueError, "value must be a dictionary"),
-        # For path=None with dict value, no exception expected, so not included here
+        (None, {}, "not a dict", ValueError, "value must be a dictionary"),
         # For invalid path types, test MLRunInvalidArgumentError is raised
-        (123, "some_value", mlrun.errors.MLRunInvalidArgumentError, "Expected path"),
-        (3.14, "some_value", mlrun.errors.MLRunInvalidArgumentError, "Expected path"),
         (
-            {"not": "a path"},
+            123,
+            {},
             "some_value",
             mlrun.errors.MLRunInvalidArgumentError,
             "Expected path",
         ),
+        (
+            3.14,
+            {},
+            "some_value",
+            mlrun.errors.MLRunInvalidArgumentError,
+            "Expected path",
+        ),
+        (
+            {"not": "a path"},
+            {},
+            "some_value",
+            mlrun.errors.MLRunInvalidArgumentError,
+            "Expected path",
+        ),
+        # List length mismatch
+        (
+            "b",
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            [10, 20],
+            mlrun.errors.MLRunInvalidArgumentError,
+            "must match data list length",
+        ),
     ],
 )
-def test_set_data_by_path_invalid_path(path, value, exc_type, exc_msg):
-    data = {}
+def test_set_data_by_path_invalid_path(path, initial_data, value, exc_type, exc_msg):
     with pytest.raises(exc_type, match=exc_msg):
-        set_data_by_path(path, data, value)
+        path_as_list = split_path(path) if isinstance(path, str) else path
+        set_data_by_path(path_as_list, initial_data, value)
+
+
+@pytest.mark.parametrize(
+    "priority_reqs, reqs, expected_result",
+    [
+        (None, None, []),
+        ([], ["requests"], ["requests"]),
+        (["requests"], [], ["requests"]),
+        (
+            ["requests>=1.0", "pydantic==1.0"],
+            ["requests==2.0", "pandas"],
+            ["requests>=1.0", "pydantic==1.0", "pandas"],
+        ),
+    ],
+)
+def test_merge_requirements(priority_reqs, reqs, expected_result):
+    result = merge_requirements(reqs_priority=priority_reqs, reqs_secondary=reqs)
+    assert set(result) == set(expected_result)
+
+
+# Test ensure_batch_job_suffix
+@pytest.mark.parametrize(
+    "function_name,expected_name,expected_renamed",
+    [
+        # Normal case - suffix should be added
+        ("my-function", "my-function-batch", True),
+        # Already has suffix - should not be renamed
+        ("my-function-batch", "my-function-batch", False),
+        # Edge cases
+        (None, None, False),
+        ("", "", False),
+        # Name contains "batch" but doesn't end with "-batch"
+        ("batch-processor", "batch-processor-batch", True),
+    ],
+)
+def test_ensure_batch_job_suffix(function_name, expected_name, expected_renamed):
+    """Test that ensure_batch_job_suffix correctly adds suffix when needed."""
+    modified_name, was_renamed, suffix = ensure_batch_job_suffix(function_name)
+
+    assert modified_name == expected_name
+    assert was_renamed == expected_renamed
+    assert suffix == "-batch"
+
+
+@pytest.mark.parametrize(
+    "function_name,expected",
+    [
+        # Invalid names - uppercase letters
+        ("MyFunction", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("FUNCTION", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("myFunction", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        # Invalid names - special characters
+        ("my_function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("my.function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("my function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("my@function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("my#function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        # Invalid names - starts/ends with dash
+        ("-myfunction", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("myfunction-", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        # Empty name - allowed (returns early without validation)
+        ("", does_not_raise()),
+        # Invalid names - too long (>63 characters)
+        (
+            "a" * 64,
+            pytest.raises(mlrun.errors.MLRunInvalidArgumentError),
+        ),
+        (
+            "my-very-long-function-name-that-exceeds-kubernetes-limit-of-sixtythree",
+            pytest.raises(mlrun.errors.MLRunInvalidArgumentError),
+        ),
+        # Valid names
+        ("myfunction", does_not_raise()),
+        ("my-function", does_not_raise()),
+        ("my-function-2", does_not_raise()),
+        ("function123", does_not_raise()),
+        ("123function", does_not_raise()),
+        ("a", does_not_raise()),
+        ("a1", does_not_raise()),
+        ("1a", does_not_raise()),
+        # Valid names - at the limit (63 characters)
+        ("a" * 63, does_not_raise()),
+        ("my-function-" + "a" * 50, does_not_raise()),
+    ],
+)
+def test_validate_function_name(function_name, expected):
+    """Test that validate_function_name enforces DNS-1123 label requirements."""
+    with expected:
+        validate_function_name(function_name)
+
+
+@pytest.mark.parametrize("token_name", [None, ""])
+def test_set_auth_token_name_noop_for_empty_token(token_name):
+    """Test that None or empty token_name does not modify spec."""
+
+    class MockSpec:
+        auth = None
+
+    spec = MockSpec()
+    set_auth_token_name(spec, token_name)
+    assert spec.auth is None
+
+
+@pytest.mark.parametrize(
+    "initial_auth,expected_auth",
+    [
+        (None, {"token_name": "my-token"}),
+        ({}, {"token_name": "my-token"}),
+        ({"other_key": "value"}, {"other_key": "value", "token_name": "my-token"}),
+        ({"token_name": "old-token"}, {"token_name": "my-token"}),
+    ],
+)
+def test_set_auth_token_name_sets_token(initial_auth, expected_auth):
+    """Test that set_auth_token_name correctly sets token on various auth states."""
+
+    class MockSpec:
+        auth = initial_auth
+
+    spec = MockSpec()
+    set_auth_token_name(spec, "my-token")
+    assert spec.auth == expected_auth
+
+
+def test_set_auth_token_name_works_with_run_spec():
+    """Test that set_auth_token_name works with actual RunSpec."""
+    import mlrun.model
+
+    spec = mlrun.model.RunSpec()
+    set_auth_token_name(spec, "my-token")
+    assert spec.auth["token_name"] == "my-token"
+
+
+def test_set_auth_token_name_works_with_nuclio_spec():
+    """Test that set_auth_token_name works with actual NuclioSpec.
+
+    Note: auth on function spec is only supported for Nuclio runtimes, not job runtimes.
+    """
+
+    spec = mlrun.runtimes.nuclio.function.NuclioSpec()
+    set_auth_token_name(spec, "my-token")
+    assert spec.auth["token_name"] == "my-token"

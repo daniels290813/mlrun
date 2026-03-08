@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ARG MLRUN_UV_IMAGE=ghcr.io/astral-sh/uv:latest
-ARG MLRUN_PYTHON_VERSION=3.9
+ARG MLRUN_PYTHON_VERSION=3.11
 ARG MLRUN_PIP_VERSION=25.0
 ARG DOCKER_DEFAULT_PLATFORM=linux/amd64
 
@@ -82,3 +82,6 @@ COPY dockerfiles dockerfiles
 COPY examples examples
 
 ENV PYTHONPATH="/mlrun/tests:/mlrun/automation:/mlrun/server/py/schemas/proto"
+
+# plant uv for next phases usage
+COPY --from=uv-image /uv /bin/uv

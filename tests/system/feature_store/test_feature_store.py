@@ -20,8 +20,9 @@ import random
 import shutil
 import string
 import tempfile
+import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from time import sleep
 
 import fsspec
@@ -37,6 +38,7 @@ from storey import MapClass
 from storey.dtypes import V3ioError
 
 import mlrun
+import mlrun.common.schemas
 import mlrun.datastore.utils
 import mlrun.feature_store as fstore
 import mlrun.runtimes.mounts
@@ -199,9 +201,9 @@ class TestFeatureStore(TestMLRunSystem):
         stocks_set["name"].description = "some name"
 
         self._logger.info(f"stocks spec: {stocks_set.to_yaml()}")
-        assert (
-            stocks_set.spec.features["name"].description == "some name"
-        ), "description was not set"
+        assert stocks_set.spec.features["name"].description == "some name", (
+            "description was not set"
+        )
         assert len(df) == len(stocks), "dataframe size doesnt match"
         assert stocks_set.status.stats["exchange"], "stats not created"
 
@@ -271,15 +273,15 @@ class TestFeatureStore(TestMLRunSystem):
             entity_timestamp_column=entity_timestamp_column,
             engine=engine,
         )
-        assert len(vector.spec.features) == len(
-            features
-        ), "unexpected num of requested features"
-        assert (
-            len(vector.status.features) == features_size
-        ), "unexpected num of returned features"
-        assert (
-            len(vector.status.stats) == features_size
-        ), "unexpected num of feature stats"
+        assert len(vector.spec.features) == len(features), (
+            "unexpected num of requested features"
+        )
+        assert len(vector.status.features) == features_size, (
+            "unexpected num of returned features"
+        )
+        assert len(vector.status.stats) == features_size, (
+            "unexpected num of feature stats"
+        )
         assert vector.status.label_column == "xx", "unexpected label_column name"
 
         df = resp.to_dataframe()
@@ -329,13 +331,13 @@ class TestFeatureStore(TestMLRunSystem):
             assert resp[0] is None
             resp = svc.get([{"ticker": "GOOG"}, {"ticker": "MSFT"}])
             resp = svc.get([{"ticker": "AAPL"}])
-            assert (
-                resp[0]["name"] == "Apple Inc" and resp[0]["exchange"] == "NASDAQ"
-            ), "unexpected online result"
+            assert resp[0]["name"] == "Apple Inc" and resp[0]["exchange"] == "NASDAQ", (
+                "unexpected online result"
+            )
             resp2 = svc.get([{"ticker": "AAPL"}], as_list=True)
-            assert (
-                len(resp2[0]) == features_size - 1
-            ), "unexpected online vector size"  # -1 label
+            assert len(resp2[0]) == features_size - 1, (
+                "unexpected online vector size"
+            )  # -1 label
 
     @TestMLRunSystem.skip_test_if_env_not_configured
     @pytest.mark.parametrize("entity_timestamp_column", [None, "time"])
@@ -458,9 +460,9 @@ class TestFeatureStore(TestMLRunSystem):
 
         vector.spec.with_indexes = True
         df_with_index = vector.get_offline_features().to_dataframe()
-        assert not isinstance(
-            df_with_index.index, pd.core.indexes.range.RangeIndex
-        ), "index column is of default type"
+        assert not isinstance(df_with_index.index, pd.core.indexes.range.RangeIndex), (
+            "index column is of default type"
+        )
         assert df_with_index.index.name == "ticker"
         assert "time" in df_with_index.columns, "'time' column should be present"
 
@@ -968,6 +970,190 @@ class TestFeatureStore(TestMLRunSystem):
             result_offline_target.as_df()
 
     @TestMLRunSystem.skip_test_if_env_not_configured
+    @pytest.mark.parametrize(
+        ("partition_keys", "granularity"),
+        [
+            (["year"], "year"),
+            (["year", "month"], "month"),
+            (["year", "month", "day"], "day"),
+            (["year", "month", "day", "hour"], "hour"),
+        ],
+    )
+    @pytest.mark.parametrize("with_tz", [True, False])
+    def test_partitioned_parquet_as_df_time_filtering_optimization(
+        self, partition_keys, granularity, with_tz
+    ):
+        """
+        test reading partitioned parquet target as_df method with time filtering
+        covers:
+          - Partitioned parquet writing via ParquetTarget
+          - Reading & filtering via start_time/end_time
+          - Empty/out-of-range case
+        """
+        key = "patient_id"
+        base_time = datetime(2020, 12, 1, 17, 0)
+        if with_tz:
+            base_time = base_time.replace(tzinfo=pytz.UTC)
+
+        df = pd.DataFrame(
+            [
+                {
+                    key: i + 1,
+                    "timestamp": base_time + timedelta(hours=i),
+                    "value": i * 10,
+                }
+                for i in range(4)
+            ]
+        )
+
+        run_id = uuid.uuid4()
+        target_path = f"v3io:///projects/{self.project_name}/partition_test_{run_id}"
+
+        target = ParquetTarget(
+            name="parquet_target",
+            path=target_path,
+            partitioned=True,
+            time_partitioning_granularity=granularity,
+        )
+
+        start_time = base_time + timedelta(hours=1)
+        end_time = base_time + timedelta(hours=2, minutes=1)
+
+        target.write_dataframe(df, timestamp_key="timestamp")
+
+        expected_df = df[
+            (df["timestamp"] > start_time) & (df["timestamp"] <= end_time)
+        ].copy()
+
+        result_df = target.as_df(
+            start_time=start_time,
+            end_time=end_time,
+            time_column="timestamp",
+        )
+
+        if with_tz:
+            result_df["timestamp"] = (
+                pd.to_datetime(result_df["timestamp"])
+                .dt.tz_convert("UTC")
+                .astype("datetime64[ns, UTC]")
+            )
+        else:
+            result_df["timestamp"] = pd.to_datetime(result_df["timestamp"]).astype(
+                "datetime64[ns]"
+            )
+
+        result_df = result_df.sort_values(key).reset_index(drop=True)
+        expected_df = expected_df.sort_values(key).reset_index(drop=True)
+        assert_frame_equal(result_df, expected_df)
+
+        large_base_period_start = base_time - timedelta(days=365)
+        large_base_period_end = base_time + timedelta(days=1)
+        start = time.monotonic()
+        result_df = target.as_df(
+            start_time=large_base_period_start,
+            end_time=large_base_period_end,
+            time_column="timestamp",
+        )
+        end = time.monotonic()
+        assert end - start < 10, "Reading large period took too long"
+        if with_tz:
+            result_df["timestamp"] = (
+                pd.to_datetime(result_df["timestamp"])
+                .dt.tz_convert("UTC")
+                .astype("datetime64[ns, UTC]")
+            )
+        else:
+            result_df["timestamp"] = pd.to_datetime(result_df["timestamp"]).astype(
+                "datetime64[ns]"
+            )
+
+        result_df = result_df.sort_values(key).reset_index(drop=True)
+        assert_frame_equal(result_df, df.sort_values(key).reset_index(drop=True))
+
+        late_start = base_time + timedelta(days=2)
+        late_end = late_start + timedelta(days=1)
+
+        empty_df = target.as_df(
+            start_time=late_start,
+            end_time=late_end,
+            time_column="timestamp",
+        )
+        assert empty_df.empty, "df should be empty for out-of-range time filter"
+
+    @TestMLRunSystem.skip_test_if_env_not_configured
+    @pytest.mark.parametrize(
+        ("partition_keys", "granularity"),
+        [
+            (["year"], "year"),
+            (["year", "month"], "month"),
+            (["year", "month", "day"], "day"),
+            (["year", "month", "day", "hour"], "hour"),
+        ],
+    )
+    @pytest.mark.parametrize("with_tz", [True, False])
+    def test_partition_uid_with_time_filtering_optimization(
+        self, partition_keys, granularity, with_tz
+    ):
+        key = "uid"
+        base_time = datetime(2020, 12, 1, 17, 0)
+        if with_tz:
+            base_time = base_time.replace(tzinfo=pytz.UTC)
+
+        df = pd.DataFrame(
+            [
+                {
+                    key: str(uuid.uuid4()),
+                    "timestamp": base_time + timedelta(hours=i),
+                    "value": i * 10,
+                }
+                for i in range(4)
+            ]
+        )
+
+        run_id = uuid.uuid4()
+        target_path = f"v3io:///projects/{self.project_name}/partition_test_{run_id}"
+
+        target = ParquetTarget(
+            name="parquet_target",
+            path=target_path,
+            partitioned=True,
+            partition_cols=[key],
+            time_partitioning_granularity=granularity,
+        )
+
+        start_time = base_time + timedelta(hours=1)
+        end_time = base_time + timedelta(hours=2, minutes=1)
+
+        target.write_dataframe(df, key_column=key, timestamp_key="timestamp")
+
+        expected_df = df[
+            (df["timestamp"] > start_time) & (df["timestamp"] <= end_time)
+        ].copy()
+
+        result_df = target.as_df(
+            start_time=start_time,
+            end_time=end_time,
+            time_column="timestamp",
+        )
+
+        if with_tz:
+            result_df["timestamp"] = (
+                pd.to_datetime(result_df["timestamp"])
+                .dt.tz_convert("UTC")
+                .astype("datetime64[ns, UTC]")
+            )
+        else:
+            result_df["timestamp"] = pd.to_datetime(result_df["timestamp"]).astype(
+                "datetime64[ns]"
+            )
+
+        result_df = result_df.sort_values(key).reset_index(drop=True)
+        result_df = result_df[expected_df.columns]
+        result_df["uid"] = result_df["uid"].astype(str)
+        expected_df = expected_df.sort_values(key).reset_index(drop=True)
+        assert_frame_equal(result_df, expected_df)
+
+    @TestMLRunSystem.skip_test_if_env_not_configured
     @pytest.mark.parametrize("key_bucketing_number", [None, 0, 4])
     @pytest.mark.parametrize("partition_cols", [None, ["department"]])
     @pytest.mark.parametrize("time_partitioning_granularity", [None, "day"])
@@ -1381,8 +1567,8 @@ class TestFeatureStore(TestMLRunSystem):
         data = pd.DataFrame(
             {
                 "time": [
-                    datetime(2021, 6, 30, 15, 9, 35, tzinfo=timezone.utc),
-                    datetime(2021, 6, 30, 15, 9, 35, tzinfo=timezone.utc),
+                    datetime(2021, 6, 30, 15, 9, 35, tzinfo=UTC),
+                    datetime(2021, 6, 30, 15, 9, 35, tzinfo=UTC),
                 ],
                 "first_name": ["katya", "dina"],
                 "bid": [2000, 10],
@@ -2877,9 +3063,9 @@ class TestFeatureStore(TestMLRunSystem):
                 raise_for_status=v3io.dataplane.RaiseForStatus.never,
             )
         except RuntimeError as err:
-            assert err.__str__().__contains__(
-                "404"
-            ), "only acceptable error is with status 404"
+            assert err.__str__().__contains__("404"), (
+                "only acceptable error is with status 404"
+            )
         finally:
             v3io_client.stream.create(
                 container="projects", stream_path=stream_path, shard_count=1
@@ -3537,7 +3723,8 @@ class TestFeatureStore(TestMLRunSystem):
             },
         }
         headers = {
-            "Cookie": "session=j:" + json.dumps({"sid": os.getenv("V3IO_ACCESS_KEY")})
+            mlrun.common.schemas.HeaderNames.cookie: f"{mlrun.common.schemas.CookieNames.iguazio}=j:"
+            + json.dumps({"sid": os.getenv("V3IO_ACCESS_KEY")})
         }
         response = requests.patch(
             request_url,
@@ -3545,9 +3732,9 @@ class TestFeatureStore(TestMLRunSystem):
             headers=headers,
             verify=config.httpdb.http.verify,
         )
-        assert (
-            response.status_code == 200
-        ), f"Failed to patch feature vector: {response}"
+        assert response.status_code == 200, (
+            f"Failed to patch feature vector: {response}"
+        )
         vector.reload()
         service = vector.get_online_feature_service()
         try:

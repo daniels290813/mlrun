@@ -42,7 +42,9 @@ from .artifact import (
 )
 from .auth import (
     AuthInfo,
+    AuthInfoKind,
     AuthorizationAction,
+    AuthorizationResourceNamespace,
     AuthorizationResourceTypes,
     AuthorizationVerificationInput,
     Credentials,
@@ -65,7 +67,9 @@ from .common import ImageBuilder
 from .constants import (
     APIStates,
     ArtifactPartitionByField,
+    AuthorizationHeaderPrefixes,
     ClusterizationRole,
+    CookieNames,
     DeletionStrategy,
     FeatureStorePartitionByField,
     HeaderNames,
@@ -111,14 +115,18 @@ from .feature_store import (
 )
 from .frontend_spec import (
     ArtifactLimits,
-    AuthenticationFeatureFlag,
     FeatureFlags,
     FrontendSpec,
     NuclioStreamsFeatureFlag,
     PreemptionNodesFeatureFlag,
     ProjectMembershipFeatureFlag,
 )
-from .function import FunctionState, PreemptionModes, SecurityContextEnrichmentModes
+from .function import (
+    BatchingSpec,
+    FunctionState,
+    PreemptionModes,
+    SecurityContextEnrichmentModes,
+)
 from .http import HTTPSessionRetryMode
 from .hub import (
     HubCatalog,
@@ -154,6 +162,7 @@ from .model_monitoring import (
     ModelEndpointSchema,
     ModelEndpointSpec,
     ModelEndpointStatus,
+    ModelMonitoringInfraLabel,
     ModelMonitoringMode,
     MonitoringFunctionNames,
     TSDBTarget,
@@ -170,7 +179,7 @@ from .notification import (
 )
 from .object import ObjectKind, ObjectMetadata, ObjectSpec, ObjectStatus
 from .pagination import PaginationInfo
-from .partition import PartitionInterval
+from .partition_interval import PartitionInterval
 from .pipeline import PipelinesOutput, PipelinesPagination
 from .project import (
     IguazioProject,
@@ -211,12 +220,22 @@ from .schedule import (
 )
 from .secret import (
     AuthSecretData,
+    DeleteSecretTokenResponse,
+    DeleteSecretTokensResponse,
+    ListSecretTokensResponse,
     SecretKeysData,
     SecretProviderName,
     SecretsData,
-    UserSecretCreationRequest,
+    SecretToken,
+    SecretTokenInfo,
+    StoreSecretTokensResponse,
 )
-from .serving import ModelRunnerStepData, ModelsData, MonitoringData
+from .serving import (
+    APIHandlerAction,
+    ModelRunnerStepData,
+    ModelsData,
+    MonitoringData,
+)
 from .tag import Tag, TagObjects
 from .workflow import (
     GetWorkflowResponse,

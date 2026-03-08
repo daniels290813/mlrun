@@ -124,9 +124,7 @@ class TestAutoMount:
         ],
     )
     def test_resolve_requirements(self, requirements, encoded_requirements):
-        encoded = self._generate_runtime().spec.build._resolve_requirements(
-            requirements
-        )
+        encoded = self._generate_runtime().spec.build.resolve_requirements(requirements)
         assert encoded == encoded_requirements, f"Failed to encode {requirements}"
 
     @pytest.mark.parametrize(
@@ -153,12 +151,12 @@ class TestAutoMount:
         # create requirements file
         requirements_file = self._create_temp_requirements_file(requirements_in_file)
 
-        encoded = self._generate_runtime().spec.build._resolve_requirements(
+        encoded = self._generate_runtime().spec.build.resolve_requirements(
             requirements, requirements_file
         )
-        assert (
-            encoded == encoded_requirements
-        ), f"Failed to encode {requirements.extend(requirements_in_file)} as file {requirements_file}"
+        assert encoded == encoded_requirements, (
+            f"Failed to encode {requirements.extend(requirements_in_file)} as file {requirements_file}"
+        )
 
     def test_fill_credentials(self, rundb_mock):
         """
@@ -328,3 +326,97 @@ class TestAutoMount:
         self._execute_run(runtime)
 
         rundb_mock.assert_runtime_categories(expected_categories)
+
+    @pytest.mark.parametrize(
+        "initial_volumes,initial_mounts,expected_volumes,expected_mounts",
+        [
+            # No volumes or mounts
+            ([], [], [], []),
+            # Only auth secret volume → removed
+            (
+                [
+                    {
+                        "name": "secret",
+                        "secret": {
+                            "secretName": "mlrun-auth-secrets.abc",
+                            "items": [],
+                        },
+                    }
+                ],
+                [{"name": "secret", "mountPath": "/var/mlrun-secrets/auth"}],
+                [],
+                [],
+            ),
+            # Non-auth secret volume → preserved
+            (
+                [
+                    {
+                        "name": "user-secret",
+                        "secret": {
+                            "secretName": "my-user-secret",
+                            "items": [],
+                        },
+                    }
+                ],
+                [{"name": "user-secret", "mountPath": "/some/path"}],
+                [
+                    {
+                        "name": "user-secret",
+                        "secret": {
+                            "secretName": "my-user-secret",
+                            "items": [],
+                        },
+                    }
+                ],
+                [{"name": "user-secret", "mountPath": "/some/path"}],
+            ),
+            # Mixed auth + non-auth → remove only auth
+            (
+                [
+                    {
+                        "name": "auth-secret",
+                        "secret": {
+                            "secretName": "mlrun-auth-secrets.abc",
+                            "items": [],
+                        },
+                    },
+                    {
+                        "name": "other-secret",
+                        "secret": {
+                            "secretName": "other-secret",
+                            "items": [],
+                        },
+                    },
+                ],
+                [
+                    {"name": "auth-secret", "mountPath": "/var/mlrun-secrets/auth"},
+                    {"name": "other-secret", "mountPath": "/some/path"},
+                ],
+                [
+                    {
+                        "name": "other-secret",
+                        "secret": {
+                            "secretName": "other-secret",
+                            "items": [],
+                        },
+                    }
+                ],
+                [{"name": "other-secret", "mountPath": "/some/path"}],
+            ),
+        ],
+    )
+    def test_remove_auth_secret_volumes(
+        self,
+        initial_volumes,
+        initial_mounts,
+        expected_volumes,
+        expected_mounts,
+    ):
+        runtime = self._generate_runtime()
+        runtime.spec.volumes = initial_volumes
+        runtime.spec.volume_mounts = initial_mounts
+
+        runtime.remove_auth_secret_volumes()
+
+        assert runtime.spec.volumes == expected_volumes
+        assert runtime.spec.volume_mounts == expected_mounts
