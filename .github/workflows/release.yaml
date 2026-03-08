@@ -123,15 +123,6 @@ jobs:
           commit: ${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
           prerelease: ${{ needs.prepare-inputs.outputs.is_stable_version == 'false' }}
-      - uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # 1.20.0
-        if: github.event.inputs.skip_create_tag_release != 'true'
-        with:
-          repo: ui
-          tag: v${{ needs.prepare-inputs.outputs.version }}
-          commit: ${{ github.ref_name }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # experienced 500 errors when trying to create release notes for ui repo with `prerelease flag`
-          # prerelease: ${{ needs.prepare-inputs.outputs.prerelease }}
 
   create-tag:
     name: Create tag v${{ needs.prepare-inputs.outputs.version }}
