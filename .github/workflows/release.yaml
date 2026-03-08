@@ -114,86 +114,13 @@ jobs:
           UI_REF_INPUT: ${{ github.event.inputs.ui_ref }}
           BUMP_VERSION_MODE_INPUT: ${{ github.event.inputs.bump_version_mode }}
           VERSION_INPUT: ${{ github.event.inputs.version }}
-
-  trigger-and-wait-for-mlrun-image-building:
-    name: Trigger build workflow in mlrun/mlrun and wait to finish
-    needs: prepare-inputs
-    uses: ./.github/workflows/build-internal.yaml
-    with:
-      docker_registries: "ghcr.io/,quay.io/,registry.hub.docker.com/"
-      version: ${{ needs.prepare-inputs.outputs.version }}
-      skip_images: ${{ github.event.inputs.skip_images }}
-    secrets: inherit
-
-  # TODO: Move to reuseable-workflow too.
-  # Requires cross-repo validation for passing github token as secret
-  trigger-and-wait-for-ui-image-building:
-    name: Trigger build workflow in mlrun/ui and wait to finish
-    runs-on: ubuntu-latest
-    needs: prepare-inputs
-    steps:
-      - name: Generate GitHub App Token for ui repo
-        id: ui-app-token
-
-        # the condition is here and not on job because some other jobs "needs" this job to be done (and not skipped)
-        if: ${{ !contains(github.event.inputs.skip_images, 'ui') }}
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ui
-      - uses: convictional/trigger-workflow-and-wait@f69fa9eedd3c62a599220f4d5745230e237904be # 1.6.5
-
-        # since some steps relay on the ui image, we need to wait for it to finish building
-        # the condition is here and not on job because some other jobs "needs" this job to be done (and not skipped)
-        if: ${{ !contains(github.event.inputs.skip_images, 'ui') }}
-        with:
-          owner: ${{ github.repository_owner }}
-          repo: ui
-          github_token: ${{ steps.ui-app-token.outputs.token }}
-          workflow_file_name: build.yaml
-          ref: ${{ needs.prepare-inputs.outputs.ui_ref }}
-          wait_interval: 60
-          client_payload: '{"docker_registries": "ghcr.io/,quay.io/,registry.hub.docker.com/", "version": "${{ needs.prepare-inputs.outputs.version }}"}'
-
-  publish-to-pypi:
-    name: Publish package to PyPI
-    runs-on: ubuntu-latest
-
-    # skip releasing to pypi for feature branches. installing mlrun can be done by:
-    # pip install 'mlrun[complete] @ git+https://github.com/mlrun/mlrun@feature/branch'
-    # pypi do not allow local version identifier (https://peps.python.org/pep-0440/#local-version-identifiers)
-    if: needs.prepare-inputs.outputs.is_feature_branch == 'false'
-
-    # publishing to pypi is (kind of) irreversible, therefore do it only if both previous steps finished successfully
-    needs: [ prepare-inputs, trigger-and-wait-for-ui-image-building, trigger-and-wait-for-mlrun-image-building ]
-    steps:
-      - name: Generate GitHub App token
-        id: mlrun-app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-      - uses: actions/checkout@v6
-        with:
-          token: ${{ steps.mlrun-app-token.outputs.token }}
-          persist-credentials: false
-      - name: Set up uv
-        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # 7.3.1
-      - name: Build & push to PyPI
-        if: github.event.inputs.skip_publish_pypi != 'true'
-        env:
-          MLRUN_VERSION: ${{ needs.prepare-inputs.outputs.version }}
-          UV_PUBLISH_USERNAME: ${{ secrets.PYPI_USERNAME }}
-          UV_PUBLISH_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-        run: uv run --no-project --with packaging~=25.0 make publish-package
+          
 
   create-releases:
     name: Create release & tag v${{ needs.prepare-inputs.outputs.version }}
     runs-on: ubuntu-latest
     if: needs.prepare-inputs.outputs.is_feature_branch == 'false'
-    needs: [ prepare-inputs, publish-to-pypi ]
+    needs: [ prepare-inputs ]
     steps:
       - name: Generate GitHub App token for mlrun repo
         id: mlrun-app-token
@@ -234,7 +161,7 @@ jobs:
     # run this specific job for feature branch only as we wont have a github release for it
     # the tag would be useful to track feature branch released versions
     if: needs.prepare-inputs.outputs.is_feature_branch == 'true'
-    needs: [ prepare-inputs, trigger-and-wait-for-mlrun-image-building ]
+    needs: [ prepare-inputs ]
     steps:
       - name: Generate GitHub App token for mlrun repo
         id: mlrun-app-token
