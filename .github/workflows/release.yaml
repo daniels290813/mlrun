@@ -156,7 +156,7 @@ jobs:
           persist-credentials: false
       - name: Create tutorials tar
         run: |
-          git clone --depth 1 --branch development https://github.com/v3io/tutorials.git /tmp/
+          git clone --depth 1 --branch development https://github.com/v3io/tutorials.git /tmp/tutorials
           cp /tmp/tutorials/welcome.ipynb docs/
           cp /tmp/tutorials/README.md docs/
           cp -r /tmp/tutorials/assets/images docs/assets/images
